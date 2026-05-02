@@ -1,263 +1,330 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import cv2
-import numpy as np
-import easyocr
-from PIL import Image
-import io
-import json
-import re
+"""
+MedRecord OCR Microservice
+FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5 drug extraction
+
+Environment variables required on Railway:
+- GOOGLE_VISION_KEY    : Google Cloud Vision API key (starts with AIzaSy...)
+- ANTHROPIC_API_KEY    : Claude API key from console.anthropic.com
+"""
+
 import os
 import base64
+import json
+import logging
+from typing import Optional
+
 import requests
-from anthropic import Anthropic
-from fuzzywuzzy import fuzz, process
-from drug_dictionary import INDIAN_DRUGS, ABBREVIATIONS
-from image_processor import enhance_image
-from drug_parser import parse_prescription
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-app = FastAPI(title="MedRecord AI Service", version="1.0.0")
+# ------------------------------------------------------------------
+# Logging setup
+# ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("medrecord-ocr")
 
-# REPLACE WITH YOUR API KEY
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GOOGLE_VISION_KEY = "AIzaSy..."
+# ------------------------------------------------------------------
+# Environment variables
+# ------------------------------------------------------------------
+GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-claude = Anthropic(api_key=ANTHROPIC_API_KEY)
+if not GOOGLE_VISION_KEY:
+    logger.warning("GOOGLE_VISION_KEY not set — Google Vision will be skipped")
+if not ANTHROPIC_API_KEY:
+    logger.warning("ANTHROPIC_API_KEY not set — Claude drug extraction will be skipped")
 
+# ------------------------------------------------------------------
+# EasyOCR — load lazily (heavy dependency)
+# ------------------------------------------------------------------
+_easyocr_reader = None
+
+def get_easyocr_reader():
+    """Lazy-load EasyOCR to avoid slow cold starts when not needed."""
+    global _easyocr_reader
+    if _easyocr_reader is None:
+        logger.info("Loading OCR engine...")
+        import easyocr
+        _easyocr_reader = easyocr.Reader(["en"], gpu=False)
+        logger.info("OCR engine ready!")
+    return _easyocr_reader
+
+# ------------------------------------------------------------------
+# FastAPI app setup
+# ------------------------------------------------------------------
+app = FastAPI(
+    title="MedRecord OCR Service",
+    description="OCR + drug extraction for lab reports and prescriptions",
+    version="1.1.0",
+)
+
+# Allow Expo/React Native app to call this from any origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-print("Loading OCR engine...")
-reader = easyocr.Reader(['en', 'hi'], gpu=False)
-print("OCR engine ready!")
+# ------------------------------------------------------------------
+# Response models
+# ------------------------------------------------------------------
+class OCRResponse(BaseModel):
+    success: bool
+    text: str
+    engine: str  # "google_vision" or "easyocr"
+    error: Optional[str] = None
 
+class DrugExtractionResponse(BaseModel):
+    success: bool
+    text: str
+    engine: str
+    drugs: list
+    error: Optional[str] = None
 
-def freq_to_label(code):
-    labels = {
-        "OD": "Once daily", "BD": "Twice daily", "TDS": "Three times",
-        "QID": "Four times", "HS": "At bedtime", "SOS": "As needed",
-        "AC": "Before meals", "PC": "After meals", "STAT": "One-time"
+# ------------------------------------------------------------------
+# OCR functions
+# ------------------------------------------------------------------
+def extract_text_google_vision(image_bytes: bytes) -> str:
+    """
+    Extract text using Google Vision REST API.
+    Uses the API key from GOOGLE_VISION_KEY env variable.
+    Raises exception on failure so caller can fall back to EasyOCR.
+    """
+    if not GOOGLE_VISION_KEY:
+        raise ValueError("GOOGLE_VISION_KEY not configured")
+
+    image_content = base64.b64encode(image_bytes).decode("utf-8")
+
+    url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_KEY}"
+    payload = {
+        "requests": [
+            {
+                "image": {"content": image_content},
+                "features": [{"type": "TEXT_DETECTION", "maxResults": 1}],
+            }
+        ]
     }
-    return labels.get(code, code)
+
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+    result = response.json()
+
+    # Defensive parsing — this is the bug that was logging "Google Vision failed: 'responses'"
+    responses = result.get("responses", [])
+    if not responses:
+        logger.warning("Google Vision returned no 'responses' field. Raw: %s", result)
+        return ""
+
+    first = responses[0]
+
+    # API may return an error inside the response object even with HTTP 200
+    if "error" in first:
+        err = first["error"]
+        raise RuntimeError(f"Google Vision API error: {err.get('message', err)}")
+
+    text_annotations = first.get("textAnnotations", [])
+    if not text_annotations:
+        return ""
+
+    # The first annotation contains the full extracted text
+    return text_annotations[0].get("description", "")
 
 
-def freq_to_times(code):
-    times_map = {
-        "OD": ["8:00 AM"],
-        "BD": ["8:00 AM", "8:00 PM"],
-        "TDS": ["8:00 AM", "2:00 PM", "8:00 PM"],
-        "QID": ["8:00 AM", "12:00 PM", "4:00 PM", "8:00 PM"],
-        "HS": ["10:00 PM"],
-        "SOS": ["As needed"],
-        "STAT": ["One-time dose"],
-        "AC": ["Before meals"],
-        "PC": ["After meals"],
-    }
-    return times_map.get(code, ["8:00 AM"])
+def extract_text_easyocr(image_bytes: bytes) -> str:
+    """Fallback OCR using EasyOCR (slower, runs on CPU)."""
+    import numpy as np
+    import cv2
+
+    reader = get_easyocr_reader()
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image bytes")
+
+    results = reader.readtext(img, detail=0, paragraph=True)
+    return "\n".join(results)
 
 
-def extract_drugs_with_claude(raw_text):
+def extract_text_with_fallback(image_bytes: bytes) -> tuple[str, str]:
+    """
+    Try Google Vision first, fall back to EasyOCR.
+    Returns (extracted_text, engine_used).
+    """
+    # Try Google Vision
     try:
-        print("\n=== OCR TEXT TO CLAUDE ===")
-        print(raw_text[:2000])
-        print("=== END ===\n")
+        text = extract_text_google_vision(image_bytes)
+        if text and text.strip():
+            logger.info("Google Vision succeeded (%d chars)", len(text))
+            return text, "google_vision"
+        logger.warning("Google Vision returned empty text — falling back to EasyOCR")
+    except Exception as e:
+        logger.warning("Google Vision failed: %s — falling back to EasyOCR", e)
 
-        prompt = "You are a medical assistant that extracts medications from prescription text.\n\n"
-        prompt += "Below is raw OCR text from a prescription or hospital discharge summary. Extract ALL medications.\n\n"
-        prompt += "EXTRACTION RULES:\n"
-        prompt += "1. Hospital discharge summaries have TWO medication sections - extract BOTH:\n"
-        prompt += "   - Course in Hospital / Given section: IV drugs administered during admission\n"
-        prompt += "   - Medication Advise / Discharge medications section: drugs to take at home\n\n"
-        prompt += "2. Mark each drug with its source using the type field:\n"
-        prompt += "   - hospital = given during hospital stay\n"
-        prompt += "   - discharge = take at home after discharge\n"
-        prompt += "   - outpatient = regular OPD prescription\n\n"
-        prompt += "3. Indian frequency notation:\n"
-        prompt += "   - 1-0-0 = OD (morning only)\n"
-        prompt += "   - 0-0-1 = HS (night only)\n"
-        prompt += "   - 1-0-1 = BD (morning and night)\n"
-        prompt += "   - 1-1-1 = TDS (3 times)\n"
-        prompt += "   - 1-1-1-1 = QID (4 times)\n"
-        prompt += "   - thrice daily / TDS / TID = TDS\n"
-        prompt += "   - twice daily / BD / BID = BD\n"
-        prompt += "   - once daily / OD / QD = OD\n"
-        prompt += "   - at bedtime / HS = HS\n\n"
-        prompt += "4. For IV/Injection drugs: frequency = STAT (one-time)\n\n"
-        prompt += "5. For each medication return:\n"
-        prompt += "   - name: drug name\n"
-        prompt += "   - dose: dosage with units\n"
-        prompt += "   - frequency: OD/BD/TDS/QID/HS/SOS/STAT\n"
-        prompt += "   - duration: number of days (default 30, use 1 for IV)\n"
-        prompt += "   - category: Diabetes, Hypertension, Cholesterol, Thyroid, Antibiotic, Pain, Gastro, Heart, Respiratory, Supplement, Psychiatric, Cancer, Chemotherapy, Steroid, Antiemetic, or Other\n"
-        prompt += "   - type: hospital, discharge, or outpatient\n"
-        prompt += "   - notes: special instructions like before food, IV, subcutaneous\n"
-        prompt += "   - route: oral, iv, im, sc, topical, inhaler, eye_drops\n\n"
-        prompt += f"OCR TEXT:\n{raw_text}\n\n"
-        prompt += 'Respond ONLY with valid JSON, no other text:\n'
-        prompt += '{"drugs": [{"name": "...", "dose": "...", "frequency": "...", "duration": 30, "category": "...", "type": "discharge", "notes": "...", "route": "oral"}]}'
+    # Fall back to EasyOCR
+    try:
+        text = extract_text_easyocr(image_bytes)
+        logger.info("EasyOCR succeeded (%d chars)", len(text))
+        return text, "easyocr"
+    except Exception as e:
+        logger.error("EasyOCR also failed: %s", e)
+        raise
 
-        response = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}]
+
+# ------------------------------------------------------------------
+# Claude — drug extraction
+# ------------------------------------------------------------------
+def extract_drugs_with_claude(ocr_text: str) -> list:
+    """Use Claude Haiku 4.5 to extract structured drug info from OCR text."""
+    if not ANTHROPIC_API_KEY:
+        logger.warning("ANTHROPIC_API_KEY not set — skipping drug extraction")
+        return []
+
+    if not ocr_text or not ocr_text.strip():
+        return []
+
+    prompt = f"""You are a medical assistant extracting medications from a prescription or hospital discharge summary.
+
+OCR text from prescription:
+---
+{ocr_text}
+---
+
+Extract every medication mentioned. For each drug, return:
+- name: generic or brand name as written
+- dosage: e.g. "500mg", "10ml" (null if not specified)
+- frequency: e.g. "twice daily", "every 8 hours" (null if not specified)
+- duration: e.g. "5 days", "1 month" (null if not specified)
+- route: "oral", "IV", "topical", etc. (null if not specified)
+- source: "hospital" if it's an IV drug or clearly given during admission, otherwise "current"
+
+Recognise common Indian abbreviations (e.g. BD = twice daily, TDS = three times daily, HS = at night, SOS = as needed).
+
+Return ONLY a valid JSON array. No prose, no markdown fences. Example:
+[{{"name": "Paracetamol", "dosage": "500mg", "frequency": "TDS", "duration": "3 days", "route": "oral", "source": "current"}}]
+
+If no medications found, return an empty array: []
+"""
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Claude returns content as a list of blocks
+        content_blocks = data.get("content", [])
+        text = "".join(
+            block.get("text", "") for block in content_blocks if block.get("type") == "text"
+        ).strip()
+
+        # Strip markdown fences if Claude wrapped JSON in them
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        drugs = json.loads(text)
+        if not isinstance(drugs, list):
+            logger.warning("Claude returned non-list: %s", type(drugs))
+            return []
+        return drugs
+    except json.JSONDecodeError as e:
+        logger.error("Claude returned invalid JSON: %s", e)
+        return []
+    except Exception as e:
+        logger.error("Claude drug extraction failed: %s", e)
+        return []
+
+
+# ------------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------------
+@app.get("/")
+def root():
+    """Health check / welcome."""
+    return {
+        "service": "MedRecord OCR",
+        "status": "running",
+        "google_vision_configured": bool(GOOGLE_VISION_KEY),
+        "claude_configured": bool(ANTHROPIC_API_KEY),
+        "endpoints": ["/health", "/ocr", "/extract-drugs", "/docs"],
+    }
+
+
+@app.get("/health")
+def health():
+    """Liveness probe for Railway."""
+    return {"status": "healthy"}
+
+
+@app.post("/ocr", response_model=OCRResponse)
+async def ocr_endpoint(file: UploadFile = File(...)):
+    """Plain OCR — returns extracted text from an image or PDF page."""
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        text, engine = extract_text_with_fallback(image_bytes)
+        return OCRResponse(success=True, text=text, engine=engine)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("OCR failed")
+        return OCRResponse(success=False, text="", engine="none", error=str(e))
+
+
+@app.post("/extract-drugs", response_model=DrugExtractionResponse)
+async def extract_drugs_endpoint(file: UploadFile = File(...)):
+    """Full pipeline: OCR -> Claude drug extraction. Used for prescriptions."""
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        text, engine = extract_text_with_fallback(image_bytes)
+        drugs = extract_drugs_with_claude(text)
+
+        return DrugExtractionResponse(
+            success=True,
+            text=text,
+            engine=engine,
+            drugs=drugs,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Drug extraction failed")
+        return DrugExtractionResponse(
+            success=False, text="", engine="none", drugs=[], error=str(e)
         )
 
-        response_text = response.content[0].text.strip()
-        print("\n=== CLAUDE RAW RESPONSE ===")
-        print(response_text)
-        print("=== END ===\n")
 
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-        response_text = response_text.strip()
-
-        result = json.loads(response_text)
-        drugs = result.get("drugs", [])
-
-        formatted = []
-        for d in drugs:
-            drug_type = d.get("type", "outpatient")
-            formatted.append({
-                "drug_name":    d.get("name", "Unknown"),
-                "generic":      d.get("name", "Unknown"),
-                "category":     d.get("category", "Other"),
-                "dosage":       d.get("dose", "See prescription"),
-                "frequency":    d.get("frequency", "OD"),
-                "freq_label":   freq_to_label(d.get("frequency", "OD")),
-                "times":        freq_to_times(d.get("frequency", "OD")),
-                "duration":     str(d.get("duration", 30)) + " days",
-                "route":        d.get("route", "oral"),
-                "type":         drug_type,
-                "notes":        d.get("notes", ""),
-                "confidence":   95,
-                "needs_review": False,
-                "ai_extracted": True,
-                "active":       drug_type in ["discharge", "outpatient"],
-            })
-        print("=== EXTRACTED " + str(len(formatted)) + " DRUGS ===\n")
-        return formatted
-
-    except Exception as e:
-        print("\n=== CLAUDE ERROR ===")
-        print(str(e))
-        print("=== END ===\n")
-        return None
-
-
-@app.get("/")
-def health_check():
-    return {
-        "status": "running",
-        "service": "MedRecord AI",
-        "version": "1.0.0"
-    }
-
-
-@app.post("/ocr/prescription")
-async def ocr_prescription(file: UploadFile = File(...)):
-    try:
-        contents  = await file.read()
-        image     = Image.open(io.BytesIO(contents))
-        img_array = np.array(image)
-
-        # Try Google Vision first (better for printed text)
-        raw_text       = ""
-        avg_confidence = 0
-
-        try:
-            img_bytes = io.BytesIO()
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            image.save(img_bytes, format='JPEG')
-            b64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
-
-            vision_resp = requests.post(
-                "https://vision.googleapis.com/v1/images:annotate?key=" + GOOGLE_VISION_KEY,
-                json={"requests": [{"image": {"content": b64}, "features": [{"type": "TEXT_DETECTION"}]}]},
-                timeout=15
-            )
-            vision_data = vision_resp.json()
-            raw_text = vision_data["responses"][0].get("fullTextAnnotation", {}).get("text", "")
-            avg_confidence = 95 if raw_text else 0
-            print("=== GOOGLE VISION OCR (length: " + str(len(raw_text)) + ") ===")
-        except Exception as e:
-            print("Google Vision failed: " + str(e))
-
-        # Fall back to EasyOCR
-        if not raw_text:
-            enhanced = enhance_image(img_array)
-            results  = reader.readtext(enhanced)
-            confidence = 0
-            for (bbox, text, conf) in results:
-                raw_text   += text + "\n"
-                confidence += conf
-            avg_confidence = (confidence / len(results) * 100) if results else 0
-
-        # Try Claude AI first
-        drugs = extract_drugs_with_claude(raw_text)
-        if drugs is None or len(drugs) == 0:
-            drugs = parse_prescription(raw_text)
-
-        return {
-            "success":        True,
-            "raw_text":       raw_text,
-            "avg_confidence": round(avg_confidence, 1),
-            "drugs_found":    len(drugs),
-            "drugs":          drugs,
-            "message":        "Found " + str(len(drugs)) + " medication(s)"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/ocr/report")
-async def ocr_report(file: UploadFile = File(...)):
-    try:
-        contents  = await file.read()
-        image     = Image.open(io.BytesIO(contents))
-        img_array = np.array(image)
-        raw_text  = ""
-
-        try:
-            img_bytes = io.BytesIO()
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            image.save(img_bytes, format='JPEG')
-            b64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
-            vision_resp = requests.post(
-                "https://vision.googleapis.com/v1/images:annotate?key=" + GOOGLE_VISION_KEY,
-                json={"requests": [{"image": {"content": b64}, "features": [{"type": "TEXT_DETECTION"}]}]},
-                timeout=15
-            )
-            vision_data = vision_resp.json()
-            raw_text = vision_data["responses"][0].get("fullTextAnnotation", {}).get("text", "")
-        except Exception as e:
-            print("Vision failed for report: " + str(e))
-
-        if not raw_text:
-            enhanced = enhance_image(img_array)
-            results  = reader.readtext(enhanced)
-            raw_text = "\n".join([text for (_, text, _) in results])
-
-        return {
-            "success":    True,
-            "raw_text":   raw_text,
-            "lab_values": [],
-            "lab_name":   "Unknown Lab",
-            "test_name":  "Lab Report",
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# ------------------------------------------------------------------
+# Local dev entrypoint (Railway uses uvicorn from start command)
+# ------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
