@@ -2,10 +2,12 @@
 MedRecord OCR Microservice
 FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5 drug extraction
 
-v1.2.0 — Improved drug classification:
-  - Tighter prompt with explicit hospital-vs-discharge guidance
-  - Deterministic post-processing: IV/infusion -> hospital
-  - Better handling of Indian dosing notation (BD/TDS/HS/SOS, 1-0-1, etc.)
+v1.3.0 — App compatibility layer:
+  - Drug objects now expose BOTH legacy & new field names so React Native PrescriptionsScreen.js works:
+      * drug_name (app expects)        + name (backend native)
+      * type: hospital | outpatient    + source: hospital | current
+  - Adds avg_confidence so the alert displays a real number
+  - Carries forward v1.2.0 deterministic IV->hospital classification
 """
 
 import os
@@ -60,7 +62,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + drug extraction for lab reports and prescriptions",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -85,6 +87,7 @@ class DrugExtractionResponse(BaseModel):
     text: str
     engine: str
     drugs: list
+    avg_confidence: int = 0  # so the app's alert shows a real number
     error: Optional[str] = None
 
 # ------------------------------------------------------------------
@@ -292,6 +295,9 @@ def extract_drugs_with_claude(ocr_text: str) -> list:
             return []
 
         drugs = post_process_drugs(drugs)
+        # Add app-compatible fields AFTER post-processing
+        drugs = add_app_compat_fields(drugs)
+
         logger.info(
             "Claude extracted %d drugs (%d hospital, %d current)",
             len(drugs),
@@ -344,6 +350,33 @@ def post_process_drugs(drugs: list) -> list:
     return cleaned
 
 
+def add_app_compat_fields(drugs: list) -> list:
+    """
+    Add field aliases the React Native app expects:
+      - drug_name  (mirror of 'name')
+      - type       ('hospital' for hospital source, 'outpatient' for current)
+    Keeps original fields too so /docs and any future client still works.
+    """
+    for d in drugs:
+        # Add drug_name alias
+        if "name" in d and "drug_name" not in d:
+            d["drug_name"] = d["name"]
+
+        # Map source -> type for app filtering
+        # App expects: 'hospital' | 'discharge' | 'outpatient'
+        source = d.get("source", "current")
+        if source == "hospital":
+            d["type"] = "hospital"
+        else:  # 'current' or anything else
+            d["type"] = "outpatient"
+
+        # Provide a category default if missing
+        if not d.get("category"):
+            d["category"] = "Medication"
+
+    return drugs
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -352,7 +385,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "endpoints": ["/health", "/ocr", "/extract-drugs", "/docs"],
@@ -387,15 +420,26 @@ async def extract_drugs_endpoint(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Empty file")
         text, engine = extract_text_with_fallback(image_bytes)
         drugs = extract_drugs_with_claude(text)
+        # Confidence is a heuristic for now: 95 if Google Vision worked, 75 if EasyOCR fallback
+        avg_conf = 95 if engine == "google_vision" else 75
         return DrugExtractionResponse(
-            success=True, text=text, engine=engine, drugs=drugs
+            success=True,
+            text=text,
+            engine=engine,
+            drugs=drugs,
+            avg_confidence=avg_conf,
         )
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("Drug extraction failed")
         return DrugExtractionResponse(
-            success=False, text="", engine="none", drugs=[], error=str(e)
+            success=False,
+            text="",
+            engine="none",
+            drugs=[],
+            avg_confidence=0,
+            error=str(e),
         )
 
 
