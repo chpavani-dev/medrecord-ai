@@ -2,11 +2,11 @@
 MedRecord OCR Microservice
 FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5 drug extraction
 
-v1.3.0 — App compatibility layer:
-  - Drug objects now expose BOTH legacy & new field names so React Native PrescriptionsScreen.js works:
-      * drug_name (app expects)        + name (backend native)
-      * type: hospital | outpatient    + source: hospital | current
-  - Adds avg_confidence so the alert displays a real number
+v1.4.0 — App route compatibility:
+  - Added /ocr/prescription alias for /extract-drugs (matches React Native app)
+  - Added /ocr/lab alias for /ocr (in case the app uses it for lab reports)
+  - Added /extract_drugs alias (underscore variant)
+  - Carries forward v1.3.0 app-compat fields (drug_name, type, avg_confidence)
   - Carries forward v1.2.0 deterministic IV->hospital classification
 """
 
@@ -62,7 +62,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + drug extraction for lab reports and prescriptions",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 app.add_middleware(
@@ -87,7 +87,7 @@ class DrugExtractionResponse(BaseModel):
     text: str
     engine: str
     drugs: list
-    avg_confidence: int = 0  # so the app's alert shows a real number
+    avg_confidence: int = 0
     error: Optional[str] = None
 
 # ------------------------------------------------------------------
@@ -295,7 +295,6 @@ def extract_drugs_with_claude(ocr_text: str) -> list:
             return []
 
         drugs = post_process_drugs(drugs)
-        # Add app-compatible fields AFTER post-processing
         drugs = add_app_compat_fields(drugs)
 
         logger.info(
@@ -355,22 +354,17 @@ def add_app_compat_fields(drugs: list) -> list:
     Add field aliases the React Native app expects:
       - drug_name  (mirror of 'name')
       - type       ('hospital' for hospital source, 'outpatient' for current)
-    Keeps original fields too so /docs and any future client still works.
     """
     for d in drugs:
-        # Add drug_name alias
         if "name" in d and "drug_name" not in d:
             d["drug_name"] = d["name"]
 
-        # Map source -> type for app filtering
-        # App expects: 'hospital' | 'discharge' | 'outpatient'
         source = d.get("source", "current")
         if source == "hospital":
             d["type"] = "hospital"
-        else:  # 'current' or anything else
+        else:
             d["type"] = "outpatient"
 
-        # Provide a category default if missing
         if not d.get("category"):
             d["category"] = "Medication"
 
@@ -378,27 +372,9 @@ def add_app_compat_fields(drugs: list) -> list:
 
 
 # ------------------------------------------------------------------
-# Endpoints
+# Shared business logic for OCR & drug extraction endpoints
 # ------------------------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "service": "MedRecord OCR",
-        "status": "running",
-        "version": "1.3.0",
-        "google_vision_configured": bool(GOOGLE_VISION_KEY),
-        "claude_configured": bool(ANTHROPIC_API_KEY),
-        "endpoints": ["/health", "/ocr", "/extract-drugs", "/docs"],
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
-
-@app.post("/ocr", response_model=OCRResponse)
-async def ocr_endpoint(file: UploadFile = File(...)):
+async def _do_ocr(file: UploadFile) -> OCRResponse:
     try:
         image_bytes = await file.read()
         if not image_bytes:
@@ -412,15 +388,13 @@ async def ocr_endpoint(file: UploadFile = File(...)):
         return OCRResponse(success=False, text="", engine="none", error=str(e))
 
 
-@app.post("/extract-drugs", response_model=DrugExtractionResponse)
-async def extract_drugs_endpoint(file: UploadFile = File(...)):
+async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
     try:
         image_bytes = await file.read()
         if not image_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
         text, engine = extract_text_with_fallback(image_bytes)
         drugs = extract_drugs_with_claude(text)
-        # Confidence is a heuristic for now: 95 if Google Vision worked, 75 if EasyOCR fallback
         avg_conf = 95 if engine == "google_vision" else 75
         return DrugExtractionResponse(
             success=True,
@@ -441,6 +415,64 @@ async def extract_drugs_endpoint(file: UploadFile = File(...)):
             avg_confidence=0,
             error=str(e),
         )
+
+
+# ------------------------------------------------------------------
+# Endpoints — multiple URL aliases for app compatibility
+# ------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "service": "MedRecord OCR",
+        "status": "running",
+        "version": "1.4.0",
+        "google_vision_configured": bool(GOOGLE_VISION_KEY),
+        "claude_configured": bool(ANTHROPIC_API_KEY),
+        "endpoints": [
+            "/health",
+            "/ocr",
+            "/ocr/lab",
+            "/ocr/prescription",
+            "/extract-drugs",
+            "/extract_drugs",
+            "/docs",
+        ],
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
+# ----- Plain OCR endpoints (return text only) -----
+@app.post("/ocr", response_model=OCRResponse)
+async def ocr_endpoint(file: UploadFile = File(...)):
+    return await _do_ocr(file)
+
+
+@app.post("/ocr/lab", response_model=OCRResponse)
+async def ocr_lab_endpoint(file: UploadFile = File(...)):
+    """Alias for /ocr — for lab report uploads from the app."""
+    return await _do_ocr(file)
+
+
+# ----- Drug extraction endpoints (OCR + Claude) -----
+@app.post("/extract-drugs", response_model=DrugExtractionResponse)
+async def extract_drugs_endpoint(file: UploadFile = File(...)):
+    return await _do_extract_drugs(file)
+
+
+@app.post("/extract_drugs", response_model=DrugExtractionResponse)
+async def extract_drugs_underscore_endpoint(file: UploadFile = File(...)):
+    """Alias for /extract-drugs (underscore variant)."""
+    return await _do_extract_drugs(file)
+
+
+@app.post("/ocr/prescription", response_model=DrugExtractionResponse)
+async def ocr_prescription_endpoint(file: UploadFile = File(...)):
+    """Alias for /extract-drugs — what the React Native app actually calls."""
+    return await _do_extract_drugs(file)
 
 
 if __name__ == "__main__":
