@@ -2,14 +2,15 @@
 MedRecord OCR Microservice
 FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5
 
-v1.5.0 — Lab report intelligence:
-  - NEW: /ocr/report endpoint for multi-panel lab parsing
-  - Auto-categorization: Blood, Urine, Imaging, Pathology, Cardiac, Other
-  - Test name normalization (S. Creatinine, Creat, Creatinine -> "Creatinine")
-  - Abnormal value flagging using report's normal range OR standard ranges
-  - Returns abnormal_findings array for Trends auto-promotion
+v1.7.0 — PDF support:
+  - NEW: Native PDF parsing via pdfplumber (digital PDFs)
+  - NEW: Scanned PDF fallback via pdf2image + OCR (rasterizes pages)
+  - All /ocr, /ocr/prescription, /ocr/report endpoints now accept PDFs
+  - Content-type dispatcher routes uploads to the right extractor
 
   Carries forward:
+  - v1.6.0: prescription_date extraction in /extract-drugs and /ocr/prescription
+  - v1.5.0: /ocr/report multi-panel parsing with abnormal_findings
   - v1.4.0: /ocr/prescription, /ocr/lab, /extract_drugs aliases
   - v1.3.0: drug_name, type, avg_confidence app-compat fields
   - v1.2.0: deterministic IV->hospital classification
@@ -17,9 +18,11 @@ v1.5.0 — Lab report intelligence:
 
 import os
 import base64
+import io
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Optional
 
 import requests
@@ -48,7 +51,7 @@ if not ANTHROPIC_API_KEY:
     logger.warning("ANTHROPIC_API_KEY not set — Claude parsing will be skipped")
 
 # ------------------------------------------------------------------
-# Standard 9 trends metrics (your existing Tier 1)
+# Standard 9 trends metrics (Tier 1)
 # ------------------------------------------------------------------
 STANDARD_METRICS = {
     "hba1c", "glucose", "hemoglobin", "haemoglobin", "tsh",
@@ -56,82 +59,79 @@ STANDARD_METRICS = {
 }
 
 # ------------------------------------------------------------------
-# Test name normalization map — variants -> canonical name
+# Test name normalization
 # ------------------------------------------------------------------
 TEST_NAME_NORMALIZATION = {
-    # Format: "lowercase_match_key": "Canonical Display Name"
-    "creatinine": "Creatinine",
-    "s. creatinine": "Creatinine",
-    "serum creatinine": "Creatinine",
-    "creat": "Creatinine",
-    "hemoglobin": "Hemoglobin",
-    "haemoglobin": "Hemoglobin",
-    "hgb": "Hemoglobin",
-    "hb": "Hemoglobin",
-    "hba1c": "HbA1c",
-    "glycated hemoglobin": "HbA1c",
-    "glycosylated hemoglobin": "HbA1c",
-    "glucose": "Glucose",
-    "fasting glucose": "Fasting Glucose",
-    "fbs": "Fasting Glucose",
-    "ppbs": "Post Prandial Glucose",
-    "post prandial glucose": "Post Prandial Glucose",
+    "creatinine": "Creatinine", "s. creatinine": "Creatinine",
+    "serum creatinine": "Creatinine", "creat": "Creatinine",
+    "hemoglobin": "Hemoglobin", "haemoglobin": "Hemoglobin",
+    "hgb": "Hemoglobin", "hb": "Hemoglobin",
+    "hba1c": "HbA1c", "glycated hemoglobin": "HbA1c", "glycosylated hemoglobin": "HbA1c",
+    "glucose": "Glucose", "fasting glucose": "Fasting Glucose", "fbs": "Fasting Glucose",
+    "ppbs": "Post Prandial Glucose", "post prandial glucose": "Post Prandial Glucose",
     "rbs": "Random Glucose",
-    "tsh": "TSH",
-    "thyroid stimulating hormone": "TSH",
-    "t3": "T3",
-    "t4": "T4",
-    "free t3": "Free T3",
-    "free t4": "Free T4",
-    "cholesterol": "Total Cholesterol",
-    "total cholesterol": "Total Cholesterol",
-    "ldl": "LDL Cholesterol",
-    "ldl cholesterol": "LDL Cholesterol",
-    "hdl": "HDL Cholesterol",
-    "hdl cholesterol": "HDL Cholesterol",
-    "triglycerides": "Triglycerides",
-    "tg": "Triglycerides",
+    "tsh": "TSH", "thyroid stimulating hormone": "TSH",
+    "t3": "T3", "t4": "T4", "free t3": "Free T3", "free t4": "Free T4",
+    "cholesterol": "Total Cholesterol", "total cholesterol": "Total Cholesterol",
+    "ldl": "LDL Cholesterol", "ldl cholesterol": "LDL Cholesterol",
+    "hdl": "HDL Cholesterol", "hdl cholesterol": "HDL Cholesterol",
+    "triglycerides": "Triglycerides", "tg": "Triglycerides",
     "uric acid": "Uric Acid",
-    "vitamin d": "Vitamin D",
-    "25 oh vitamin d": "Vitamin D",
-    "25-oh vitamin d": "Vitamin D",
-    "vitamin b12": "Vitamin B12",
-    "b12": "Vitamin B12",
-    "wbc": "WBC",
-    "white blood cells": "WBC",
-    "rbc": "RBC",
-    "red blood cells": "RBC",
-    "platelets": "Platelets",
-    "plt": "Platelets",
-    "esr": "ESR",
-    "crp": "CRP",
-    "sgot": "SGOT (AST)",
-    "ast": "SGOT (AST)",
-    "sgpt": "SGPT (ALT)",
-    "alt": "SGPT (ALT)",
-    "bilirubin": "Bilirubin Total",
-    "total bilirubin": "Bilirubin Total",
-    "urea": "Urea",
-    "blood urea": "Urea",
-    "bun": "BUN",
-    "sodium": "Sodium",
-    "na": "Sodium",
-    "potassium": "Potassium",
-    "k": "Potassium",
+    "vitamin d": "Vitamin D", "25 oh vitamin d": "Vitamin D", "25-oh vitamin d": "Vitamin D",
+    "vitamin b12": "Vitamin B12", "b12": "Vitamin B12",
+    "wbc": "WBC", "white blood cells": "WBC",
+    "rbc": "RBC", "red blood cells": "RBC",
+    "platelets": "Platelets", "plt": "Platelets",
+    "esr": "ESR", "crp": "CRP",
+    "sgot": "SGOT (AST)", "ast": "SGOT (AST)",
+    "sgpt": "SGPT (ALT)", "alt": "SGPT (ALT)",
+    "bilirubin": "Bilirubin Total", "total bilirubin": "Bilirubin Total",
+    "urea": "Urea", "blood urea": "Urea", "bun": "BUN",
+    "sodium": "Sodium", "na": "Sodium",
+    "potassium": "Potassium", "k": "Potassium",
 }
 
 
 def normalize_test_name(raw_name: str) -> str:
-    """Normalize a test name to canonical form. Falls back to TitleCase if unknown."""
     if not raw_name:
         return raw_name
     key = raw_name.strip().lower()
-    # Strip leading "S." (serum) or "P." (plasma) prefixes
     key = re.sub(r"^[sp]\.\s*", "", key)
     if key in TEST_NAME_NORMALIZATION:
         return TEST_NAME_NORMALIZATION[key]
-    # Fallback: TitleCase the original
     return raw_name.strip().title()
+
+
+# ------------------------------------------------------------------
+# Date normalization
+# ------------------------------------------------------------------
+def normalize_date(raw_date) -> Optional[str]:
+    if not raw_date or not isinstance(raw_date, str):
+        return None
+    s = raw_date.strip()
+    if not s or s.lower() in ("null", "none", "n/a"):
+        return None
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    patterns = [
+        "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+        "%d/%m/%y", "%d-%m-%y",
+        "%d %B %Y", "%d %b %Y",
+        "%B %d, %Y", "%b %d, %Y",
+        "%Y/%m/%d", "%Y-%m-%d",
+        "%m/%d/%Y", "%m-%d-%Y",
+    ]
+    for p in patterns:
+        try:
+            dt = datetime.strptime(s, p)
+            now = datetime.now()
+            if dt.year < 1950 or dt > datetime(now.year + 1, 12, 31):
+                continue
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    logger.warning("Could not normalize date: %s", raw_date)
+    return None
 
 
 # ------------------------------------------------------------------
@@ -148,13 +148,14 @@ def get_easyocr_reader():
         logger.info("OCR engine ready!")
     return _easyocr_reader
 
+
 # ------------------------------------------------------------------
 # FastAPI app
 # ------------------------------------------------------------------
 app = FastAPI(
     title="MedRecord OCR Service",
-    description="OCR + AI parsing for prescriptions and lab reports",
-    version="1.5.0",
+    description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
+    version="1.7.0",
 )
 
 app.add_middleware(
@@ -164,6 +165,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ------------------------------------------------------------------
 # Response models
@@ -179,6 +181,9 @@ class DrugExtractionResponse(BaseModel):
     text: str
     engine: str
     drugs: list
+    prescription_date: Optional[str] = None
+    doctor_name: Optional[str] = None
+    hospital_name: Optional[str] = None
     avg_confidence: int = 0
     error: Optional[str] = None
 
@@ -193,6 +198,7 @@ class LabReportResponse(BaseModel):
     abnormal_findings: list = []
     avg_confidence: int = 0
     error: Optional[str] = None
+
 
 # ------------------------------------------------------------------
 # OCR — Google Vision via REST
@@ -211,21 +217,16 @@ def extract_text_google_vision(image_bytes: bytes) -> str:
             }
         ]
     }
-
     response = requests.post(url, json=payload, timeout=30)
     response.raise_for_status()
     result = response.json()
-
     responses = result.get("responses", [])
     if not responses:
-        logger.warning("Google Vision returned no 'responses' field")
         return ""
-
     first = responses[0]
     if "error" in first:
         err = first["error"]
         raise RuntimeError(f"Google Vision API error: {err.get('message', err)}")
-
     text_annotations = first.get("textAnnotations", [])
     if not text_annotations:
         return ""
@@ -235,24 +236,22 @@ def extract_text_google_vision(image_bytes: bytes) -> str:
 def extract_text_easyocr(image_bytes: bytes) -> str:
     import numpy as np
     import cv2
-
     reader = get_easyocr_reader()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Could not decode image bytes")
-
     results = reader.readtext(img, detail=0, paragraph=True)
     return "\n".join(results)
 
 
 def extract_text_with_fallback(image_bytes: bytes) -> tuple[str, str]:
+    """OCR an image (jpeg/png) with Google Vision -> EasyOCR fallback."""
     try:
         text = extract_text_google_vision(image_bytes)
         if text and text.strip():
             logger.info("Google Vision succeeded (%d chars)", len(text))
             return text, "google_vision"
-        logger.warning("Google Vision returned empty text — falling back to EasyOCR")
     except Exception as e:
         logger.warning("Google Vision failed: %s — falling back to EasyOCR", e)
 
@@ -266,9 +265,101 @@ def extract_text_with_fallback(image_bytes: bytes) -> tuple[str, str]:
 
 
 # ==================================================================
-# DRUG EXTRACTION (unchanged from v1.4.0)
+# NEW v1.7.0 — PDF text extraction
 # ==================================================================
-DRUG_EXTRACTION_PROMPT = """You are a clinical pharmacist extracting EVERY medication from an Indian hospital discharge summary or prescription. Do not skip ANY drug.
+def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str]:
+    """
+    Extract text from a PDF. Tries pdfplumber first (works for digital PDFs).
+    Falls back to rasterizing pages and OCR-ing them (for scanned PDFs).
+    Returns (text, engine) where engine is one of:
+      - "pdf_text"      — pdfplumber direct text
+      - "pdf_ocr"       — rasterized + Google Vision / EasyOCR
+      - "pdf_failed"    — couldn't extract anything
+    """
+    # ---- Strategy 1: pdfplumber (digital PDFs) ----
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text_parts = []
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+            full_text = "\n".join(text_parts).strip()
+            if full_text and len(full_text) > 50:
+                logger.info("pdfplumber extracted %d chars from %d pages",
+                            len(full_text), len(pdf.pages))
+                return full_text, "pdf_text"
+            else:
+                logger.info("pdfplumber got only %d chars — likely a scanned PDF, falling back to OCR",
+                            len(full_text))
+    except Exception as e:
+        logger.warning("pdfplumber failed: %s — falling back to OCR", e)
+
+    # ---- Strategy 2: rasterize each page and OCR ----
+    try:
+        from pdf2image import convert_from_bytes
+        images = convert_from_bytes(pdf_bytes, dpi=200)
+        # Cap at 10 pages to avoid runaway costs
+        if len(images) > 10:
+            logger.warning("PDF has %d pages — capping at first 10", len(images))
+            images = images[:10]
+
+        all_text = []
+        last_engine = "easyocr"
+        for i, img in enumerate(images):
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            page_bytes = buf.getvalue()
+            try:
+                page_text, engine = extract_text_with_fallback(page_bytes)
+                last_engine = engine
+                if page_text:
+                    all_text.append(page_text)
+            except Exception as page_e:
+                logger.warning("Page %d OCR failed: %s", i + 1, page_e)
+                continue
+
+        full_text = "\n".join(all_text).strip()
+        if full_text:
+            logger.info("PDF OCR extracted %d chars from %d page(s) using %s",
+                        len(full_text), len(images), last_engine)
+            return full_text, "pdf_ocr"
+    except Exception as e:
+        logger.error("PDF rasterization failed: %s", e)
+
+    logger.error("All PDF extraction strategies failed")
+    return "", "pdf_failed"
+
+
+def detect_pdf(file: UploadFile, file_bytes: bytes) -> bool:
+    """Detect if uploaded file is a PDF based on content-type or magic bytes."""
+    content_type = (file.content_type or "").lower()
+    if "pdf" in content_type:
+        return True
+    filename = (file.filename or "").lower()
+    if filename.endswith(".pdf"):
+        return True
+    # Magic bytes: PDFs start with "%PDF-"
+    if file_bytes[:5] == b"%PDF-":
+        return True
+    return False
+
+
+def get_text_from_upload(file: UploadFile, file_bytes: bytes) -> tuple[str, str]:
+    """
+    Unified text extraction dispatcher.
+    Returns (text, engine) for any supported upload type.
+    """
+    if detect_pdf(file, file_bytes):
+        return extract_text_from_pdf(file_bytes)
+    return extract_text_with_fallback(file_bytes)
+
+
+# ==================================================================
+# DRUG EXTRACTION
+# ==================================================================
+DRUG_EXTRACTION_PROMPT = """You are a clinical pharmacist parsing an Indian prescription or hospital discharge summary.
 
 OCR TEXT:
 ---
@@ -277,45 +368,64 @@ OCR TEXT:
 
 # YOUR TASK
 
-Extract ALL medications. Indian discharge summaries have TWO sections:
+Return a JSON object with TWO parts:
 
-## Section 1: HOSPITAL MEDICATIONS (drugs given during admission)
+## Part 1: METADATA — find these fields
+- `prescription_date`: The date the prescription was written / discharge date / report date.
+  - Look for "Date:", "Issued on:", "Discharge Date:", "Admission Date:", or any date near the doctor's signature
+  - For discharge summaries, prefer the DISCHARGE date (not admission date)
+  - Indian format is often DD/MM/YYYY or DD-MM-YYYY (e.g., "28/04/2026" = April 28, 2026)
+  - Normalize to YYYY-MM-DD format (e.g., "2026-04-28")
+  - If multiple dates exist, prefer the one closest to "Discharge", "Date", or doctor signature
+  - If no date found, use null
+- `doctor_name`: Name of the prescribing doctor (e.g., "Dr. Rajesh Kumar"). Null if not present.
+- `hospital_name`: Name of the hospital or clinic. Null if not present.
+
+## Part 2: DRUGS — extract every medication
+
+Indian discharge summaries have TWO sections:
+
+### HOSPITAL MEDICATIONS (during admission)
 - IV / Intravenous infusions, Injections (Inj.)
-- Chemo drugs (Docetaxel, Carboplatin, Phesgo, etc.)
-- Premedications (Ondansetron, Pantoprazole, Pheniramine, Dexamethasone, Fosaprepitant, etc.)
-For these, set "source": "hospital".
+- Chemo drugs, premedications
+- Set "source": "hospital"
 
-## Section 2: DISCHARGE / TAKE-HOME MEDICATIONS
+### DISCHARGE / TAKE-HOME MEDICATIONS
 - TAB./CAP./SYP. prefixes, oral pills
 - Indian dosing: 1-0-0, 1-1-1, BD, TDS, HS, SOS
-For these, set "source": "current".
+- Set "source": "current"
 
 # OUTPUT FORMAT
-Return ONLY a JSON array. No prose, no markdown fences:
+
+Return ONLY a JSON object. No prose, no markdown fences:
 {{
-  "name": "drug name",
-  "dosage": "e.g. '500mg' or null",
-  "frequency": "e.g. 'BD', '1-0-0' or null",
-  "duration": "e.g. '5 days' or null",
-  "route": "oral | IV | subcutaneous | topical | inhalation",
-  "source": "hospital | current"
+  "prescription_date": "YYYY-MM-DD or null",
+  "doctor_name": "Dr. Name or null",
+  "hospital_name": "Hospital or null",
+  "drugs": [
+    {{
+      "name": "drug name",
+      "dosage": "e.g. '500mg' or null",
+      "frequency": "e.g. 'BD', '1-0-0' or null",
+      "duration": "e.g. '5 days' or null",
+      "route": "oral | IV | subcutaneous | topical | inhalation",
+      "source": "hospital | current"
+    }}
+  ]
 }}
 
 # ABBREVIATIONS
 BD=twice daily, TDS=three times daily, QID=four times, HS=bedtime, SOS=as needed
 1-0-0=morning, 1-1-1=morning/afternoon/night, 1-0-1=morning/night
 
-Now extract the medications as a JSON array:"""
+Now parse the document and return the JSON object:"""
 
 
-def extract_drugs_with_claude(ocr_text: str) -> list:
-    if not ANTHROPIC_API_KEY:
-        return []
-    if not ocr_text or not ocr_text.strip():
-        return []
+def extract_drugs_with_claude(ocr_text: str) -> dict:
+    if not ANTHROPIC_API_KEY or not ocr_text or not ocr_text.strip():
+        return {"drugs": [], "prescription_date": None, "doctor_name": None, "hospital_name": None}
 
     prompt = DRUG_EXTRACTION_PROMPT.format(ocr_text=ocr_text)
-
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
@@ -331,13 +441,10 @@ def extract_drugs_with_claude(ocr_text: str) -> list:
     try:
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=payload,
-            timeout=60,
+            headers=headers, json=payload, timeout=60,
         )
         response.raise_for_status()
         data = response.json()
-
         content_blocks = data.get("content", [])
         text = "".join(
             block.get("text", "") for block in content_blocks if block.get("type") == "text"
@@ -348,27 +455,38 @@ def extract_drugs_with_claude(ocr_text: str) -> list:
             if text.lower().startswith("json"):
                 text = text[4:].strip()
 
-        json_match = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
         if json_match:
             text = json_match.group(0)
 
-        drugs = json.loads(text)
-        if not isinstance(drugs, list):
-            return []
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            return {"drugs": [], "prescription_date": None, "doctor_name": None, "hospital_name": None}
 
+        drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
         drugs = add_drug_app_compat_fields(drugs)
-        logger.info("Drugs: %d total (%d hospital, %d current)",
+
+        rx_date = normalize_date(result.get("prescription_date"))
+
+        logger.info("Drugs: %d total (%d hospital, %d current) | date: %s | hospital: %s",
                     len(drugs),
                     sum(1 for d in drugs if d.get("source") == "hospital"),
-                    sum(1 for d in drugs if d.get("source") == "current"))
-        return drugs
+                    sum(1 for d in drugs if d.get("source") == "current"),
+                    rx_date, result.get("hospital_name"))
+
+        return {
+            "drugs": drugs,
+            "prescription_date": rx_date,
+            "doctor_name": result.get("doctor_name"),
+            "hospital_name": result.get("hospital_name"),
+        }
     except json.JSONDecodeError as e:
-        logger.error("Claude returned invalid JSON for drugs: %s", e)
-        return []
+        logger.error("Claude returned invalid JSON for drugs: %s | text: %s", e, text[:300])
+        return {"drugs": [], "prescription_date": None, "doctor_name": None, "hospital_name": None}
     except Exception as e:
         logger.error("Claude drug extraction failed: %s", e)
-        return []
+        return {"drugs": [], "prescription_date": None, "doctor_name": None, "hospital_name": None}
 
 
 def post_process_drugs(drugs: list) -> list:
@@ -378,18 +496,15 @@ def post_process_drugs(drugs: list) -> list:
             continue
         name = str(d.get("name", "")).strip()
         route = str(d.get("route", "") or "").lower()
-
         is_iv = any(kw in route for kw in ["iv", "intravenous", "infusion", "subcutaneous", "inj"])
         is_inj = bool(re.match(r"^\s*inj\.?\b", name, re.IGNORECASE))
         if is_iv or is_inj:
             d["source"] = "hospital"
-
         is_oral = bool(re.match(r"^\s*(tab|cap|syp|syr)\.?\b", name, re.IGNORECASE))
         if is_oral:
             d["source"] = "current"
             if not d.get("route"):
                 d["route"] = "oral"
-
         if not d.get("source"):
             d["source"] = "current"
         cleaned.append(d)
@@ -408,7 +523,7 @@ def add_drug_app_compat_fields(drugs: list) -> list:
 
 
 # ==================================================================
-# LAB REPORT EXTRACTION (NEW in v1.5.0)
+# LAB REPORT EXTRACTION
 # ==================================================================
 LAB_REPORT_PROMPT = """You are a clinical lab technician parsing a lab report from an Indian diagnostic lab (SRL, Thyrocare, Metropolis, Dr. Lal Path Labs, Apollo, Vijaya, etc.).
 
@@ -419,42 +534,46 @@ OCR TEXT:
 
 # YOUR TASK
 
-Parse this lab report and extract EVERY test result. Return STRUCTURED JSON.
+Parse this lab report into STRUCTURED JSON. A SINGLE upload may contain MULTIPLE PANELS — split them into separate panel objects.
 
-A SINGLE upload may contain MULTIPLE PANELS — split them into separate panel objects.
+# DATE EXTRACTION (CRITICAL)
 
-## CATEGORIES TO USE
+Find `report_date`:
+- Look for "Reported on:", "Report Date:", "Date:", "Sample collected:", "Tested on:"
+- If both COLLECTION and REPORT date exist, prefer REPORT date
+- Indian format is often DD/MM/YYYY (e.g., "28/04/2026" = April 28, 2026)
+- Normalize to YYYY-MM-DD format
+- If no date found, use null
+
+# CATEGORIES
 
 Auto-categorize each panel into ONE of:
-- "Blood" — CBC, LFT, RFT/KFT, Lipid Panel, HbA1c, Thyroid (TSH/T3/T4), Glucose, Vitamin D/B12, Iron Studies, Electrolytes
+- "Blood" — CBC, LFT, RFT/KFT, Lipid Panel, HbA1c, Thyroid, Glucose, Vitamin D/B12, Iron, Electrolytes
 - "Urine" — Urinalysis, Microalbumin, 24-hr protein, Urine culture
 - "Imaging" — X-Ray, CT, MRI, Ultrasound, Mammogram, Echo
 - "Pathology" — Biopsy, FNAC, Cytology, Histopathology
 - "Cardiac" — ECG, 2D Echo, TMT, Holter
-- "Other" — anything else
+- "Other"
 
-## DETECTING PANELS
+# COMMON PANELS
 
-A panel is a logical grouping of related tests. Common Indian lab panels:
-- "Complete Blood Count" / "CBC" / "Hemogram" → Blood (Hemoglobin, WBC, RBC, Platelets, MCV, MCH, etc.)
-- "Lipid Profile" / "Lipid Panel" → Blood (Cholesterol, LDL, HDL, Triglycerides)
-- "Liver Function Test" / "LFT" → Blood (Bilirubin, SGOT, SGPT, Albumin)
-- "Renal Function Test" / "RFT" / "KFT" → Blood (Urea, Creatinine, BUN, Uric Acid)
-- "Thyroid Profile" → Blood (TSH, T3, T4)
-- "HbA1c" → Blood (HbA1c, often standalone)
-- "Glucose" / "FBS" / "PPBS" → Blood
-- "Urinalysis" / "Urine Routine" → Urine
-- "Vitamin D" / "Vitamin B12" → Blood
+- "Complete Blood Count" / "CBC" / "Hemogram" -> Blood
+- "Lipid Profile" / "Lipid Panel" -> Blood
+- "Liver Function Test" / "LFT" -> Blood
+- "Renal Function Test" / "RFT" / "KFT" -> Blood
+- "Thyroid Profile" -> Blood
+- "HbA1c" -> Blood
+- "Urinalysis" / "Urine Routine" -> Urine
 
-If panel name is unclear, infer from the tests present (e.g., Hb + WBC + Platelets = "Complete Blood Count").
+If panel name unclear, infer from tests present (Hb + WBC + Platelets = "Complete Blood Count").
 
-## OUTPUT FORMAT
+# OUTPUT FORMAT
 
-Return ONLY a JSON object (NOT array). No prose, no markdown fences:
+Return ONLY a JSON object. No prose, no markdown fences:
 {{
-  "lab_name": "name of lab/diagnostic center or null",
+  "lab_name": "name or null",
   "report_date": "YYYY-MM-DD or null",
-  "patient_name": "patient name or null",
+  "patient_name": "name or null",
   "panels": [
     {{
       "panel_name": "Complete Blood Count",
@@ -472,36 +591,19 @@ Return ONLY a JSON object (NOT array). No prose, no markdown fences:
   ]
 }}
 
-## RULES FOR EACH TEST
+# RULES
 
-1. **value**: Use a number for numeric results (12.5, 7800, 0.8). Use a string for qualitative (e.g., "Yellow", "Trace", "Negative", "Positive"). Use null if missing.
-2. **unit**: Extract exactly as printed (g/dL, mg/dL, /cumm, %, IU/L, ng/mL). Null if no unit.
-3. **normal_range**: Extract from the report (e.g., "13.0-17.0", "<200", ">40"). Null if not in report.
-4. **flag**: One of:
-   - "low" — value below normal range
-   - "high" — value above normal range
-   - "critical_low" — dangerously low (e.g., Hb < 7, K < 2.5, Glucose < 50)
-   - "critical_high" — dangerously high (e.g., K > 6, Glucose > 400, Creat > 5)
-   - "abnormal" — for qualitative results that aren't normal (e.g., Protein "Trace" when normal is "Negative")
-   - "normal" — within range
-   - null — cannot determine
-5. **name**: Use the test name as printed. Don't normalize — backend handles that.
+1. **value**: Number for numeric (12.5, 7800). String for qualitative ("Yellow", "Trace"). Null if missing.
+2. **unit**: Exactly as printed. Null if no unit.
+3. **normal_range**: Extract from report. Null if not present.
+4. **flag**: "low" | "high" | "critical_low" | "critical_high" | "abnormal" | "normal" | null
+5. **name**: Use printed name. Don't normalize — backend handles that.
+6. Extract EVERY test you see. Don't skip.
 
-## CRITICAL RULES
-
-- Extract EVERY test you see, even ones you don't recognize. Don't skip.
-- If you can't determine the flag, use null — don't guess.
-- For Indian reports, "S." prefix means "Serum" (e.g., "S. Creatinine" = Creatinine in serum) — keep the name as-is.
-- Lab name is often in the header/footer (e.g., "SRL Diagnostics", "Thyrocare", "Dr. Lal Path Labs").
-- Report date format is often DD/MM/YYYY in India — convert to YYYY-MM-DD.
-- If multiple dates exist (collection, report), prefer the report date.
-
-Now parse the lab report and return the JSON object:"""
+Now parse the report and return the JSON object:"""
 
 
-# Standard reference ranges (used as fallback when report doesn't include them)
 STANDARD_REFERENCE_RANGES = {
-    # Lab values: (low, high, unit, critical_low, critical_high)
     "Hemoglobin":        {"low": 12.0, "high": 17.0, "unit": "g/dL", "critical_low": 7.0,  "critical_high": 20.0},
     "HbA1c":             {"low": 4.0,  "high": 5.7,  "unit": "%",    "critical_low": None, "critical_high": 12.0},
     "Glucose":           {"low": 70,   "high": 100,  "unit": "mg/dL","critical_low": 50,   "critical_high": 400},
@@ -521,14 +623,9 @@ STANDARD_REFERENCE_RANGES = {
 
 
 def determine_flag(test_name: str, value, normal_range: str) -> Optional[str]:
-    """Determine flag (normal/low/high/critical) — uses report's normal range if available, else standard ranges."""
-    if value is None:
-        return None
-    # Skip flagging for non-numeric values (we trust Claude's flag for those)
-    if not isinstance(value, (int, float)):
+    if value is None or not isinstance(value, (int, float)):
         return None
 
-    # First try standard reference ranges (more reliable than parsing arbitrary range strings)
     canonical = normalize_test_name(test_name)
     if canonical in STANDARD_REFERENCE_RANGES:
         ref = STANDARD_REFERENCE_RANGES[canonical]
@@ -542,41 +639,28 @@ def determine_flag(test_name: str, value, normal_range: str) -> Optional[str]:
             return "high"
         return "normal"
 
-    # Fallback: try to parse the report's normal_range string
     if normal_range:
         rng = normal_range.strip()
-        # Handle "X-Y" format
         m = re.match(r"^([\d.]+)\s*[-–]\s*([\d.]+)", rng)
         if m:
             low, high = float(m.group(1)), float(m.group(2))
-            if value < low:
-                return "low"
-            if value > high:
-                return "high"
+            if value < low: return "low"
+            if value > high: return "high"
             return "normal"
-        # Handle "<X" format (upper limit only)
         m = re.match(r"^<\s*([\d.]+)", rng)
         if m:
-            high = float(m.group(1))
-            return "high" if value > high else "normal"
-        # Handle ">X" format (lower limit only)
+            return "high" if value > float(m.group(1)) else "normal"
         m = re.match(r"^>\s*([\d.]+)", rng)
         if m:
-            low = float(m.group(1))
-            return "low" if value < low else "normal"
-
+            return "low" if value < float(m.group(1)) else "normal"
     return None
 
 
 def parse_lab_report_with_claude(ocr_text: str) -> dict:
-    """Parse lab report into structured panels + tests with abnormal_findings."""
-    if not ANTHROPIC_API_KEY:
-        return {"panels": [], "abnormal_findings": []}
-    if not ocr_text or not ocr_text.strip():
+    if not ANTHROPIC_API_KEY or not ocr_text or not ocr_text.strip():
         return {"panels": [], "abnormal_findings": []}
 
     prompt = LAB_REPORT_PROMPT.format(ocr_text=ocr_text)
-
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
@@ -592,13 +676,10 @@ def parse_lab_report_with_claude(ocr_text: str) -> dict:
     try:
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=payload,
-            timeout=90,
+            headers=headers, json=payload, timeout=90,
         )
         response.raise_for_status()
         data = response.json()
-
         content_blocks = data.get("content", [])
         text = "".join(
             block.get("text", "") for block in content_blocks if block.get("type") == "text"
@@ -609,21 +690,20 @@ def parse_lab_report_with_claude(ocr_text: str) -> dict:
             if text.lower().startswith("json"):
                 text = text[4:].strip()
 
-        # Find the JSON object (Claude returns object for lab reports, not array)
         json_match = re.search(r"\{.*\}", text, re.DOTALL)
         if json_match:
             text = json_match.group(0)
 
         result = json.loads(text)
         if not isinstance(result, dict):
-            logger.warning("Claude returned non-dict for lab: %s", type(result))
             return {"panels": [], "abnormal_findings": []}
 
-        # Post-process: normalize names, re-flag values, build abnormal_findings
+        result["report_date"] = normalize_date(result.get("report_date"))
+
         result = post_process_lab_report(result)
         return result
     except json.JSONDecodeError as e:
-        logger.error("Claude returned invalid JSON for lab: %s | text: %s", e, text[:500])
+        logger.error("Claude returned invalid JSON for lab: %s", e)
         return {"panels": [], "abnormal_findings": []}
     except Exception as e:
         logger.error("Claude lab parsing failed: %s", e)
@@ -631,7 +711,6 @@ def parse_lab_report_with_claude(ocr_text: str) -> dict:
 
 
 def post_process_lab_report(result: dict) -> dict:
-    """Normalize test names, refine flags, build abnormal_findings list."""
     panels = result.get("panels", [])
     if not isinstance(panels, list):
         panels = []
@@ -651,19 +730,15 @@ def post_process_lab_report(result: dict) -> dict:
             raw_name = t.get("name", "")
             canonical = normalize_test_name(raw_name)
             t["name"] = canonical
-            t["original_name"] = raw_name  # keep original for reference
-
-            # Mark if it's a standard Tier 1 metric
+            t["original_name"] = raw_name
             t["is_standard_metric"] = canonical.lower() in STANDARD_METRICS
 
-            # Recompute flag using our deterministic ranges (trust this over Claude's flag for numeric values)
             value = t.get("value")
             normal_range = t.get("normal_range") or ""
             our_flag = determine_flag(canonical, value, normal_range)
             if our_flag is not None:
                 t["flag"] = our_flag
 
-            # Build abnormal_findings entry
             flag = t.get("flag")
             if flag in ("low", "high", "critical_low", "critical_high", "abnormal"):
                 abnormal_findings.append({
@@ -682,20 +757,34 @@ def post_process_lab_report(result: dict) -> dict:
     n_panels = len(panels)
     n_tests = sum(len(p.get("tests", [])) for p in panels)
     n_abnormal = len(abnormal_findings)
-    logger.info("Lab parsed: %d panels, %d tests, %d abnormal", n_panels, n_tests, n_abnormal)
+    logger.info("Lab parsed: %d panels, %d tests, %d abnormal | date: %s",
+                n_panels, n_tests, n_abnormal, result.get("report_date"))
 
     return result
 
 
 # ------------------------------------------------------------------
-# Shared business logic
+# Engine -> confidence mapping
+# ------------------------------------------------------------------
+def confidence_for_engine(engine: str) -> int:
+    if engine == "google_vision": return 95
+    if engine == "pdf_text":      return 95
+    if engine == "pdf_ocr":       return 80
+    if engine == "easyocr":       return 75
+    return 0
+
+
+# ------------------------------------------------------------------
+# Shared business logic — now dispatches by file type
 # ------------------------------------------------------------------
 async def _do_ocr(file: UploadFile) -> OCRResponse:
     try:
-        image_bytes = await file.read()
-        if not image_bytes:
+        file_bytes = await file.read()
+        if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
-        text, engine = extract_text_with_fallback(image_bytes)
+        text, engine = get_text_from_upload(file, file_bytes)
+        if engine == "pdf_failed":
+            return OCRResponse(success=False, text="", engine=engine, error="Could not extract any text from PDF")
         return OCRResponse(success=True, text=text, engine=engine)
     except HTTPException:
         raise
@@ -706,15 +795,24 @@ async def _do_ocr(file: UploadFile) -> OCRResponse:
 
 async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
     try:
-        image_bytes = await file.read()
-        if not image_bytes:
+        file_bytes = await file.read()
+        if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
-        text, engine = extract_text_with_fallback(image_bytes)
-        drugs = extract_drugs_with_claude(text)
-        avg_conf = 95 if engine == "google_vision" else 75
+        text, engine = get_text_from_upload(file, file_bytes)
+        if engine == "pdf_failed" or not text:
+            return DrugExtractionResponse(
+                success=False, text="", engine=engine,
+                drugs=[], avg_confidence=0,
+                error="Could not extract any text from upload",
+            )
+        result = extract_drugs_with_claude(text)
         return DrugExtractionResponse(
             success=True, text=text, engine=engine,
-            drugs=drugs, avg_confidence=avg_conf,
+            drugs=result.get("drugs", []),
+            prescription_date=result.get("prescription_date"),
+            doctor_name=result.get("doctor_name"),
+            hospital_name=result.get("hospital_name"),
+            avg_confidence=confidence_for_engine(engine),
         )
     except HTTPException:
         raise
@@ -728,22 +826,27 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
 
 async def _do_lab_report(file: UploadFile) -> LabReportResponse:
     try:
-        image_bytes = await file.read()
-        if not image_bytes:
+        file_bytes = await file.read()
+        if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
-        text, engine = extract_text_with_fallback(image_bytes)
+        text, engine = get_text_from_upload(file, file_bytes)
+        if engine == "pdf_failed" or not text:
+            return LabReportResponse(
+                success=False, text="", engine=engine,
+                panels=[], abnormal_findings=[],
+                avg_confidence=0,
+                error="Could not extract any text from upload",
+            )
         parsed = parse_lab_report_with_claude(text)
-        avg_conf = 95 if engine == "google_vision" else 75
         return LabReportResponse(
             success=True,
-            text=text,
-            engine=engine,
+            text=text, engine=engine,
             lab_name=parsed.get("lab_name"),
             report_date=parsed.get("report_date"),
             patient_name=parsed.get("patient_name"),
             panels=parsed.get("panels", []),
             abnormal_findings=parsed.get("abnormal_findings", []),
-            avg_confidence=avg_conf,
+            avg_confidence=confidence_for_engine(engine),
         )
     except HTTPException:
         raise
@@ -764,18 +867,13 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.5.0",
+        "version": "1.7.0",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
+        "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
         "endpoints": [
-            "/health",
-            "/ocr",
-            "/ocr/lab",
-            "/ocr/prescription",
-            "/ocr/report",
-            "/extract-drugs",
-            "/extract_drugs",
-            "/docs",
+            "/health", "/ocr", "/ocr/lab", "/ocr/prescription",
+            "/ocr/report", "/extract-drugs", "/extract_drugs", "/docs",
         ],
     }
 
@@ -785,7 +883,6 @@ def health():
     return {"status": "healthy"}
 
 
-# ----- Plain OCR -----
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(file: UploadFile = File(...)):
     return await _do_ocr(file)
@@ -793,11 +890,9 @@ async def ocr_endpoint(file: UploadFile = File(...)):
 
 @app.post("/ocr/lab", response_model=OCRResponse)
 async def ocr_lab_endpoint(file: UploadFile = File(...)):
-    """Plain OCR alias for lab images."""
     return await _do_ocr(file)
 
 
-# ----- Drug extraction (prescriptions) -----
 @app.post("/extract-drugs", response_model=DrugExtractionResponse)
 async def extract_drugs_endpoint(file: UploadFile = File(...)):
     return await _do_extract_drugs(file)
@@ -810,18 +905,11 @@ async def extract_drugs_underscore_endpoint(file: UploadFile = File(...)):
 
 @app.post("/ocr/prescription", response_model=DrugExtractionResponse)
 async def ocr_prescription_endpoint(file: UploadFile = File(...)):
-    """OCR + drug extraction — what the React Native PrescriptionsScreen calls."""
     return await _do_extract_drugs(file)
 
 
-# ----- Lab report parsing (NEW) -----
 @app.post("/ocr/report", response_model=LabReportResponse)
 async def ocr_report_endpoint(file: UploadFile = File(...)):
-    """
-    OCR + multi-panel lab report parsing.
-    Returns structured panels with auto-categorization, flagged abnormal values,
-    and an abnormal_findings list for Trends auto-promotion.
-    """
     return await _do_lab_report(file)
 
 
