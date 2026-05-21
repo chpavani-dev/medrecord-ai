@@ -2,7 +2,14 @@
 MedRecord OCR Microservice
 FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5
 
-v1.8.0 — Handwritten prescription auto-detect (cascade):
+v1.8.1 — Always-vision for image prescriptions:
+  - CHANGED: Image prescriptions ALWAYS use Claude vision (was cascade with text fallback)
+  - PDFs still use text extraction (their text is already clean)
+  - Cascade approach returned partial/incorrect data for handwritten Rx;
+    always-vision is simpler and more reliable
+  - Vision path captures dosage + frequency + drug names holistically
+
+  v1.8.0 — Handwritten prescription auto-detect (cascade):
   - NEW: extract_drugs_with_claude_vision(image_bytes) sends image directly to Claude
   - NEW: /ocr/prescription cascades — tries cheap OCR+Haiku first; if <2 drugs detected,
          falls back to Claude vision (handles handwriting much better)
@@ -162,7 +169,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.8.0",
+    version="1.8.1",
 )
 
 app.add_middleware(
@@ -967,24 +974,19 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
 
         is_pdf = detect_pdf(file, file_bytes)
 
-        # ---- Stage 1: cheap OCR + Haiku text pipeline ----
-        text, engine = get_text_from_upload(file, file_bytes)
-        if engine == "pdf_failed" or not text:
-            # For PDFs we can't do vision fallback (would need rasterization which
-            # we already attempted in extract_text_from_pdf). Return failure.
-            return DrugExtractionResponse(
-                success=False, text="", engine=engine,
-                drugs=[], avg_confidence=0,
-                error="Could not extract any text from upload",
-            )
-
-        text_result = extract_drugs_with_claude(text)
-        text_drugs = text_result.get("drugs", []) or []
-
-        # ---- Stage 2: cascade decision ----
-        # If the cheap path found enough drugs, return that.
-        # If <2 drugs AND we have a real image (not PDF), try Claude vision.
-        if len(text_drugs) >= 2 or is_pdf:
+        # =================================================================
+        # PDF PATH: text extraction (PDF text is clean — no need for vision)
+        # =================================================================
+        if is_pdf:
+            text, engine = get_text_from_upload(file, file_bytes)
+            if engine == "pdf_failed" or not text:
+                return DrugExtractionResponse(
+                    success=False, text="", engine=engine,
+                    drugs=[], avg_confidence=0,
+                    error="Could not extract text from PDF",
+                )
+            text_result = extract_drugs_with_claude(text)
+            text_drugs = text_result.get("drugs", []) or []
             avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
             return DrugExtractionResponse(
                 success=True, text=text, engine=engine,
@@ -995,47 +997,46 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
                 avg_confidence=avg_conf,
             )
 
-        logger.info("Cheap path returned %d drug(s) — falling back to Claude vision", len(text_drugs))
-
-        # ---- Stage 3: Claude vision fallback (handwriting!) ----
+        # =================================================================
+        # IMAGE PATH: ALWAYS use Claude vision (handles both printed + handwritten)
+        # The cheap OCR+Haiku-text path produces unreliable partial results on
+        # handwriting (drug names captured but no dosages/frequencies). Vision
+        # is roughly cost-neutral and produces holistic, usable results.
+        # =================================================================
+        logger.info("Image prescription — using Claude vision (always-on)")
         vision_result = extract_drugs_with_claude_vision(file_bytes)
         vision_drugs = vision_result.get("drugs", []) or []
 
-        # If vision also returned nothing meaningful, prefer whichever found more
-        if not vision_drugs and not text_drugs:
+        if not vision_drugs:
+            # Vision failed completely — last-ditch fallback to OCR pipeline
+            logger.warning("Claude vision returned 0 drugs — falling back to OCR")
+            text, engine = get_text_from_upload(file, file_bytes)
+            if text:
+                text_result = extract_drugs_with_claude(text)
+                text_drugs = text_result.get("drugs", []) or []
+                if text_drugs:
+                    avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
+                    return DrugExtractionResponse(
+                        success=True, text=text, engine=f"vision_failed+{engine}",
+                        drugs=text_drugs,
+                        prescription_date=text_result.get("prescription_date"),
+                        doctor_name=text_result.get("doctor_name"),
+                        hospital_name=text_result.get("hospital_name"),
+                        avg_confidence=avg_conf,
+                    )
             return DrugExtractionResponse(
-                success=True, text=text,
-                engine=f"{engine}+vision_failed",
-                drugs=[],
-                avg_confidence=0,
+                success=True, text="", engine="vision_failed",
+                drugs=[], avg_confidence=0,
             )
 
-        if len(vision_drugs) >= len(text_drugs):
-            # Vision did better — use its result, blend metadata if missing
-            final_drugs = vision_drugs
-            final_date = vision_result.get("prescription_date") or text_result.get("prescription_date")
-            final_doctor = vision_result.get("doctor_name") or text_result.get("doctor_name")
-            final_hospital = vision_result.get("hospital_name") or text_result.get("hospital_name")
-            # Vision engine confidence sits between cheap OCR and Google Vision
-            avg_conf = compute_avg_confidence(final_drugs, 85)
-            return DrugExtractionResponse(
-                success=True, text=text,
-                engine=f"{engine}+vision",
-                drugs=final_drugs,
-                prescription_date=final_date,
-                doctor_name=final_doctor,
-                hospital_name=final_hospital,
-                avg_confidence=avg_conf,
-            )
-
-        # Cheap path returned more — keep it
-        avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
+        # Vision succeeded — return its result
+        avg_conf = compute_avg_confidence(vision_drugs, 85)
         return DrugExtractionResponse(
-            success=True, text=text, engine=engine,
-            drugs=text_drugs,
-            prescription_date=text_result.get("prescription_date"),
-            doctor_name=text_result.get("doctor_name"),
-            hospital_name=text_result.get("hospital_name"),
+            success=True, text="", engine="claude_vision",
+            drugs=vision_drugs,
+            prescription_date=vision_result.get("prescription_date"),
+            doctor_name=vision_result.get("doctor_name"),
+            hospital_name=vision_result.get("hospital_name"),
             avg_confidence=avg_conf,
         )
     except HTTPException:
@@ -1091,7 +1092,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.8.0",
+        "version": "1.8.1",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
