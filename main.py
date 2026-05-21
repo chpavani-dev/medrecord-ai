@@ -2,10 +2,17 @@
 MedRecord OCR Microservice
 FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5
 
-v1.7.0 — PDF support:
-  - NEW: Native PDF parsing via pdfplumber (digital PDFs)
-  - NEW: Scanned PDF fallback via pdf2image + OCR (rasterizes pages)
-  - All /ocr, /ocr/prescription, /ocr/report endpoints now accept PDFs
+v1.8.0 — Handwritten prescription auto-detect (cascade):
+  - NEW: extract_drugs_with_claude_vision(image_bytes) sends image directly to Claude
+  - NEW: /ocr/prescription cascades — tries cheap OCR+Haiku first; if <2 drugs detected,
+         falls back to Claude vision (handles handwriting much better)
+  - NEW: avg_confidence reflects extraction quality (high/medium/low)
+         App can show a "please verify" banner only when confidence is low
+
+  v1.7.0 — PDF support:
+  - Native PDF parsing via pdfplumber (digital PDFs)
+  - Scanned PDF fallback via pdf2image + OCR (rasterizes pages)
+  - All /ocr, /ocr/prescription, /ocr/report endpoints accept PDFs
   - Content-type dispatcher routes uploads to the right extractor
 
   Carries forward:
@@ -155,7 +162,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 app.add_middleware(
@@ -489,6 +496,165 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
         return {"drugs": [], "prescription_date": None, "doctor_name": None, "hospital_name": None}
 
 
+# ==================================================================
+# NEW v1.8.0 — Claude vision direct path for handwritten prescriptions
+# ==================================================================
+DRUG_VISION_PROMPT = """You are a clinical pharmacist looking at a photograph of an Indian doctor's prescription or hospital discharge summary. The handwriting may be messy. Read it carefully, drug by drug.
+
+# YOUR TASK
+
+Return a JSON object with two parts:
+
+## Part 1: METADATA
+- prescription_date: Visit/consultation/discharge date in YYYY-MM-DD format. Look in printed header AND handwritten notes.
+- doctor_name: Prescribing doctor's name (e.g., "Dr. Rajesh Kumar"). Null if not present.
+- hospital_name: Hospital or clinic name. Null if not present.
+
+## Part 2: DRUGS — extract EVERY medication you see
+Indian prescriptions usually number drugs (1, 2, 3...) often scattered across the page.
+- Look at ALL columns, not just top-to-bottom
+- Drug names usually start with "Tab.", "Cap.", "Syp.", "Inj."
+- Common Indian brand names: Deplatt, Ecospirin, Telma, Atorva, Metoprolol, Pan, Crocin, Dolo, Glycomet, Amlong, Concor, Eptus, Dytor, Hyponat, L-Montus, Valentas
+- Indian dosing notation: 1-0-0 (morning only), 1-0-1 (morning+night), 1-1-1 (3x/day), BD/TDS/QID, HS (bedtime), SOS (as needed), PO OD (per oral once daily)
+- If a drug name is partially illegible, give your best phonetic guess and lower the confidence
+
+## CONFIDENCE
+- For each drug, include "confidence": "high", "medium", or "low" based on how clearly you could read it
+- "high" = name and dose clearly legible
+- "medium" = name OR dose required interpretation
+- "low" = significant guesswork on name or dose
+
+# OUTPUT FORMAT
+
+Return ONLY JSON, no prose, no markdown fences:
+{
+  "prescription_date": "YYYY-MM-DD or null",
+  "doctor_name": "string or null",
+  "hospital_name": "string or null",
+  "drugs": [
+    {
+      "name": "drug name as written",
+      "dosage": "e.g. '500mg' or null",
+      "frequency": "BD | TDS | 1-0-1 | 1-1-1 | HS | SOS | OD | etc or null",
+      "duration": "e.g. '5 days' or null",
+      "route": "oral | IV | subcutaneous | topical | inhalation | null",
+      "source": "current | hospital",
+      "confidence": "high | medium | low"
+    }
+  ]
+}
+
+Read the image carefully and return the JSON object:"""
+
+
+def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
+    """
+    Send image DIRECTLY to Claude Haiku vision — no OCR step.
+    Designed for handwritten prescriptions where OCR fails.
+    Returns same shape as extract_drugs_with_claude().
+    """
+    if not ANTHROPIC_API_KEY or not image_bytes:
+        return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                "hospital_name": None, "method": "vision_failed"}
+
+    # Encode image as base64
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 4096,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": DRUG_VISION_PROMPT},
+            ],
+        }],
+    }
+
+    text = ""
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers, json=payload, timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content_blocks = data.get("content", [])
+        text = "".join(
+            block.get("text", "") for block in content_blocks if block.get("type") == "text"
+        ).strip()
+
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                    "hospital_name": None, "method": "vision_failed"}
+
+        drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
+        drugs = post_process_drugs(drugs)
+        drugs = add_drug_app_compat_fields(drugs)
+
+        rx_date = normalize_date(result.get("prescription_date"))
+
+        logger.info("Vision extraction: %d drugs | high:%d medium:%d low:%d | date:%s",
+                    len(drugs),
+                    sum(1 for d in drugs if d.get("confidence") == "high"),
+                    sum(1 for d in drugs if d.get("confidence") == "medium"),
+                    sum(1 for d in drugs if d.get("confidence") == "low"),
+                    rx_date)
+
+        return {
+            "drugs": drugs,
+            "prescription_date": rx_date,
+            "doctor_name": result.get("doctor_name"),
+            "hospital_name": result.get("hospital_name"),
+            "method": "vision",
+        }
+    except json.JSONDecodeError as e:
+        logger.error("Claude vision returned invalid JSON: %s | text: %s", e, text[:300])
+        return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                "hospital_name": None, "method": "vision_failed"}
+    except Exception as e:
+        logger.error("Claude vision extraction failed: %s", e)
+        return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                "hospital_name": None, "method": "vision_failed"}
+
+
+def compute_avg_confidence(drugs: list, base_engine_confidence: int) -> int:
+    """
+    Combine engine quality with per-drug confidence to produce a 0-100 score.
+    App uses this to decide whether to show a 'please verify' banner.
+    """
+    if not drugs:
+        return 0
+    levels = {"high": 95, "medium": 80, "low": 60}
+    drug_scores = [levels.get(d.get("confidence", "high"), 90) for d in drugs]
+    drug_avg = sum(drug_scores) / len(drug_scores)
+    # Blend with engine confidence (60/40 weighted toward drug-level)
+    return int(0.6 * drug_avg + 0.4 * base_engine_confidence)
+
+
 def post_process_drugs(drugs: list) -> list:
     cleaned = []
     for d in drugs:
@@ -798,21 +964,79 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
         file_bytes = await file.read()
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
+
+        is_pdf = detect_pdf(file, file_bytes)
+
+        # ---- Stage 1: cheap OCR + Haiku text pipeline ----
         text, engine = get_text_from_upload(file, file_bytes)
         if engine == "pdf_failed" or not text:
+            # For PDFs we can't do vision fallback (would need rasterization which
+            # we already attempted in extract_text_from_pdf). Return failure.
             return DrugExtractionResponse(
                 success=False, text="", engine=engine,
                 drugs=[], avg_confidence=0,
                 error="Could not extract any text from upload",
             )
-        result = extract_drugs_with_claude(text)
+
+        text_result = extract_drugs_with_claude(text)
+        text_drugs = text_result.get("drugs", []) or []
+
+        # ---- Stage 2: cascade decision ----
+        # If the cheap path found enough drugs, return that.
+        # If <2 drugs AND we have a real image (not PDF), try Claude vision.
+        if len(text_drugs) >= 2 or is_pdf:
+            avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
+            return DrugExtractionResponse(
+                success=True, text=text, engine=engine,
+                drugs=text_drugs,
+                prescription_date=text_result.get("prescription_date"),
+                doctor_name=text_result.get("doctor_name"),
+                hospital_name=text_result.get("hospital_name"),
+                avg_confidence=avg_conf,
+            )
+
+        logger.info("Cheap path returned %d drug(s) — falling back to Claude vision", len(text_drugs))
+
+        # ---- Stage 3: Claude vision fallback (handwriting!) ----
+        vision_result = extract_drugs_with_claude_vision(file_bytes)
+        vision_drugs = vision_result.get("drugs", []) or []
+
+        # If vision also returned nothing meaningful, prefer whichever found more
+        if not vision_drugs and not text_drugs:
+            return DrugExtractionResponse(
+                success=True, text=text,
+                engine=f"{engine}+vision_failed",
+                drugs=[],
+                avg_confidence=0,
+            )
+
+        if len(vision_drugs) >= len(text_drugs):
+            # Vision did better — use its result, blend metadata if missing
+            final_drugs = vision_drugs
+            final_date = vision_result.get("prescription_date") or text_result.get("prescription_date")
+            final_doctor = vision_result.get("doctor_name") or text_result.get("doctor_name")
+            final_hospital = vision_result.get("hospital_name") or text_result.get("hospital_name")
+            # Vision engine confidence sits between cheap OCR and Google Vision
+            avg_conf = compute_avg_confidence(final_drugs, 85)
+            return DrugExtractionResponse(
+                success=True, text=text,
+                engine=f"{engine}+vision",
+                drugs=final_drugs,
+                prescription_date=final_date,
+                doctor_name=final_doctor,
+                hospital_name=final_hospital,
+                avg_confidence=avg_conf,
+            )
+
+        # Cheap path returned more — keep it
+        avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
         return DrugExtractionResponse(
             success=True, text=text, engine=engine,
-            drugs=result.get("drugs", []),
-            prescription_date=result.get("prescription_date"),
-            doctor_name=result.get("doctor_name"),
-            hospital_name=result.get("hospital_name"),
-            avg_confidence=confidence_for_engine(engine),
+            drugs=text_drugs,
+            prescription_date=text_result.get("prescription_date"),
+            doctor_name=text_result.get("doctor_name"),
+            hospital_name=text_result.get("hospital_name"),
+            avg_confidence=avg_conf,
         )
     except HTTPException:
         raise
@@ -867,10 +1091,16 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.7.0",
+        "version": "1.8.0",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
+        "features": {
+            "handwriting_auto_detect": True,
+            "claude_vision_fallback": True,
+            "multi_panel_labs": True,
+            "duplicate_detection": False,
+        },
         "endpoints": [
             "/health", "/ocr", "/ocr/lab", "/ocr/prescription",
             "/ocr/report", "/extract-drugs", "/extract_drugs", "/docs",
