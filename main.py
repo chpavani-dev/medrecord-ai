@@ -2,7 +2,13 @@
 MedRecord OCR Microservice
 FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5
 
-v1.8.1 — Always-vision for image prescriptions:
+v1.8.2 — Precision fix for handwritten prescriptions:
+  - CHANGED: Tightened vision prompt to NOT extract vitals/diagnosis/instructions as drugs
+  - NEW: filter_non_medications() drops items that are clearly vitals
+         (BP, PR, HR, Wt, Ht, SpO2, Temp, RR) before returning
+  - Vision was capturing too much from handwritten Rx — now reads only meds
+
+  v1.8.1 — Always-vision for image prescriptions:
   - CHANGED: Image prescriptions ALWAYS use Claude vision (was cascade with text fallback)
   - PDFs still use text extraction (their text is already clean)
   - Cascade approach returned partial/incorrect data for handwritten Rx;
@@ -169,7 +175,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.8.1",
+    version="1.8.2",
 )
 
 app.add_middleware(
@@ -479,6 +485,7 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
 
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
+        drugs = filter_non_medications(drugs)
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -506,7 +513,7 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
 # ==================================================================
 # NEW v1.8.0 — Claude vision direct path for handwritten prescriptions
 # ==================================================================
-DRUG_VISION_PROMPT = """You are a clinical pharmacist looking at a photograph of an Indian doctor's prescription or hospital discharge summary. The handwriting may be messy. Read it carefully, drug by drug.
+DRUG_VISION_PROMPT = """You are a clinical pharmacist looking at a photograph of an Indian doctor's prescription or hospital discharge summary. The handwriting may be messy. Read it carefully and extract ONLY medications.
 
 # YOUR TASK
 
@@ -517,18 +524,58 @@ Return a JSON object with two parts:
 - doctor_name: Prescribing doctor's name (e.g., "Dr. Rajesh Kumar"). Null if not present.
 - hospital_name: Hospital or clinic name. Null if not present.
 
-## Part 2: DRUGS — extract EVERY medication you see
-Indian prescriptions usually number drugs (1, 2, 3...) often scattered across the page.
-- Look at ALL columns, not just top-to-bottom
-- Drug names usually start with "Tab.", "Cap.", "Syp.", "Inj."
+## Part 2: MEDICATIONS ONLY — extract real prescribed drugs
+
+A medication is something the patient TAKES. Usually:
+- Prefixed by "Tab.", "Cap.", "Syp.", "Inj.", "Sol.", "Drops"
 - Common Indian brand names: Deplatt, Ecospirin, Telma, Atorva, Metoprolol, Pan, Crocin, Dolo, Glycomet, Amlong, Concor, Eptus, Dytor, Hyponat, L-Montus, Valentas
-- Indian dosing notation: 1-0-0 (morning only), 1-0-1 (morning+night), 1-1-1 (3x/day), BD/TDS/QID, HS (bedtime), SOS (as needed), PO OD (per oral once daily)
-- If a drug name is partially illegible, give your best phonetic guess and lower the confidence
+- Has a dosage in mg/mcg/ml AND/OR a frequency
+
+# CRITICAL — DO NOT INCLUDE THESE AS MEDICATIONS:
+
+❌ VITALS & MEASUREMENTS (NEVER drugs):
+   - BP, B.P, Blood Pressure (e.g., "BP 130/85 mmHg")
+   - PR, P.R, Pulse Rate, HR, Heart Rate (e.g., "PR 91/min")
+   - SpO2, Oxygen Saturation (e.g., "SpO2 98%")
+   - Wt, Weight (e.g., "Wt 78 kg")
+   - Ht, Height
+   - Temp, Temperature
+   - RR, Respiratory Rate
+   - BMI
+
+❌ DIAGNOSIS & EXAM FINDINGS (NEVER drugs):
+   - CABG, CVS, RS, CNS, P/A (anatomy/exam abbreviations)
+   - Hypertension, Diabetes, "Mod LV Dysfunction"
+   - Any line containing "Dysfunction", "Syndrome", "Disease"
+   - "S1 S2 normal", "No murmurs"
+
+❌ INSTRUCTIONS & LIFESTYLE (NEVER drugs):
+   - "Fluid restriction <1L/day"
+   - "Salt restriction"
+   - "Walk 30 min daily"
+   - "Review after X days"
+   - "Follow up"
+
+❌ LAB TESTS (these are ORDERS not drugs):
+   - CBC, RFT, LFT, KFT, ECG, ECHO, X-Ray, MRI, CT, Ultrasound
+   - Even if they appear in a numbered list
+
+# INDIAN DOSING NOTATION (for frequency field)
+- 1-0-0 (morning only)
+- 1-0-1 (morning + night)
+- 1-1-1 (morning + afternoon + night)
+- BD = twice daily
+- TDS / TID = three times daily
+- QID = four times daily
+- HS = at bedtime
+- SOS = as needed
+- OD = once daily
+- PO OD = orally once daily
 
 ## CONFIDENCE
-- For each drug, include "confidence": "high", "medium", or "low" based on how clearly you could read it
-- "high" = name and dose clearly legible
-- "medium" = name OR dose required interpretation
+For each drug, include "confidence": "high", "medium", or "low":
+- "high" = name AND dose AND frequency clearly legible
+- "medium" = at least one field required interpretation
 - "low" = significant guesswork on name or dose
 
 # OUTPUT FORMAT
@@ -540,7 +587,7 @@ Return ONLY JSON, no prose, no markdown fences:
   "hospital_name": "string or null",
   "drugs": [
     {
-      "name": "drug name as written",
+      "name": "drug name as written (e.g., 'Tab. Deplatt-CV')",
       "dosage": "e.g. '500mg' or null",
       "frequency": "BD | TDS | 1-0-1 | 1-1-1 | HS | SOS | OD | etc or null",
       "duration": "e.g. '5 days' or null",
@@ -550,6 +597,13 @@ Return ONLY JSON, no prose, no markdown fences:
     }
   ]
 }
+
+# DOUBLE-CHECK BEFORE RETURNING
+
+Before you return, look at every item in your drugs list and ask:
+- Is this something a pharmacist would dispense? (If no → REMOVE)
+- Does the name contain "BP", "PR", "HR", "Wt", "Ht", "SpO2", "Temp", "BMI"? (If yes → REMOVE)
+- Is this a vital sign measurement like "130/85" or "91/min" or "98%"? (If yes → REMOVE)
 
 Read the image carefully and return the JSON object:"""
 
@@ -620,6 +674,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
 
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
+        drugs = filter_non_medications(drugs)
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -660,6 +715,73 @@ def compute_avg_confidence(drugs: list, base_engine_confidence: int) -> int:
     drug_avg = sum(drug_scores) / len(drug_scores)
     # Blend with engine confidence (60/40 weighted toward drug-level)
     return int(0.6 * drug_avg + 0.4 * base_engine_confidence)
+
+
+def filter_non_medications(drugs: list) -> list:
+    """
+    Safety-net filter. Drops items that are clearly vitals, diagnosis tokens,
+    or lab test orders rather than medications. Used after Claude vision
+    extraction to catch anything the prompt missed.
+    """
+    # Tokens that, if they appear as the WHOLE NAME (case-insensitive),
+    # mean this isn't a drug. Order-sensitive: check exact name first.
+    NON_DRUG_NAMES = {
+        # Vitals
+        "bp", "b.p", "b.p.", "blood pressure",
+        "pr", "p.r", "p.r.", "pulse", "pulse rate",
+        "hr", "h.r", "heart rate",
+        "spo2", "sp02", "spo 2", "oxygen saturation",
+        "wt", "weight",
+        "ht", "height",
+        "temp", "temperature",
+        "rr", "r.r", "respiratory rate",
+        "bmi",
+        # Exam findings
+        "cvs", "rs", "cns", "p/a", "cabg",
+        # Lab tests (these are orders, not drugs)
+        "cbc", "rft", "lft", "kft", "ecg", "echo", "x-ray", "mri", "ct", "ultrasound", "usg",
+    }
+
+    # Phrase fragments that, if present anywhere in name/dosage, mean it's not a drug
+    NON_DRUG_PHRASES = [
+        "mmhg", "/min", "kg", "%spo", "% spo",
+        "dysfunction", "syndrome",
+        "fluid restriction", "salt restriction",
+        "review after", "follow up", "f/u",
+    ]
+
+    cleaned = []
+    for d in drugs:
+        if not isinstance(d, dict):
+            continue
+        raw_name = str(d.get("name", "") or "").strip()
+        if not raw_name:
+            continue
+
+        name_lower = raw_name.lower()
+        # Strip leading "tab.", "cap.", "syp." etc to compare the core token
+        core_name = re.sub(r"^\s*(tab|cap|syp|syr|inj|sol|drops)\.?\s+", "", name_lower).strip()
+
+        # Reject if the entire name is a known non-drug token
+        if core_name in NON_DRUG_NAMES:
+            logger.info("Filtered non-medication: %s (exact match)", raw_name)
+            continue
+
+        # Reject if any non-drug phrase is in the name or dosage field
+        combined = (raw_name + " " + str(d.get("dosage", "") or "")).lower()
+        if any(phrase in combined for phrase in NON_DRUG_PHRASES):
+            logger.info("Filtered non-medication: %s (phrase match)", raw_name)
+            continue
+
+        # Reject obvious vital-sign value patterns in the name
+        # e.g. "130/85", "98%", "91/min"
+        if re.search(r"\b\d{2,3}/\d{2,3}\b|\b\d{2,3}\s*%\b|\b\d{2,3}\s*/\s*min\b", raw_name):
+            logger.info("Filtered non-medication: %s (vital-value pattern)", raw_name)
+            continue
+
+        cleaned.append(d)
+
+    return cleaned
 
 
 def post_process_drugs(drugs: list) -> list:
@@ -1092,7 +1214,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.8.1",
+        "version": "1.8.2",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
