@@ -460,17 +460,17 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str]:
                 page_text = page.extract_text()
                 if page_text:
                     text_parts.append(page_text)
-           if full_text and len(full_text) > 50:
-               logger.info("pdfplumber extracted %d chars from %d pages",
-                    len(full_text), len(pdf.pages))
-           full_text = strip_text_watermarks(full_text)
-           return full_text, "pdf_text"
-                else:
+            full_text = "\n".join(text_parts).strip()
+            if full_text and len(full_text) > 50:
+                logger.info("pdfplumber extracted %d chars from %d pages",
+                            len(full_text), len(pdf.pages))
+                full_text = strip_text_watermarks(full_text)
+                return full_text, "pdf_text"
+            else:
                 logger.info("pdfplumber got only %d chars — likely a scanned PDF, falling back to OCR",
                             len(full_text))
     except Exception as e:
         logger.warning("pdfplumber failed: %s — falling back to OCR", e)
-
     # ---- Strategy 2: rasterize each page and OCR ----
     try:
         from pdf2image import convert_from_bytes
