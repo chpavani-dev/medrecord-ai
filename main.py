@@ -2,7 +2,7 @@
 MedRecord OCR Microservice
 FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5
 
-v1.8.2 — Precision fix for handwritten prescriptions:
+vv1.9.0 — Precision fix for handwritten prescriptions:
   - CHANGED: Tightened vision prompt to NOT extract vitals/diagnosis/instructions as drugs
   - NEW: filter_non_medications() drops items that are clearly vitals
          (BP, PR, HR, Wt, Ht, SpO2, Temp, RR) before returning
@@ -152,7 +152,161 @@ def normalize_date(raw_date) -> Optional[str]:
             continue
     logger.warning("Could not normalize date: %s", raw_date)
     return None
+# ================================================================
+# WATERMARK REMOVAL FUNCTIONS - add to main.py after the imports
+# ================================================================
 
+def strip_text_watermarks(text: str) -> str:
+    """
+    Remove repeated watermark words from pdfplumber-extracted text.
+    Watermarks in digital PDFs appear as the same word/phrase repeated
+    many times scattered throughout the text.
+    Strategy: find words that appear suspiciously often relative to
+    total word count, and remove them if they look like watermarks.
+    """
+    if not text:
+        return text
+
+    import re
+    from collections import Counter
+
+    # Split into words, preserve structure
+    words = text.split()
+    if len(words) < 20:
+        return text  # Too short to analyze
+
+    # Count word frequencies (case-insensitive)
+    word_counts = Counter(w.lower().strip('.,;:()[]') for w in words if len(w) > 2)
+    total_words = len(words)
+
+    # A word is a watermark candidate if it appears > 3% of total words
+    # AND appears more than 5 times (avoid false positives on short docs)
+    watermark_words = set()
+    for word, count in word_counts.items():
+        frequency = count / total_words
+        if frequency > 0.03 and count > 5:
+            # Additional check: watermark words are usually all-caps or title case
+            # and are NOT common medical/lab words
+            COMMON_LAB_WORDS = {
+                'the', 'and', 'for', 'with', 'not', 'are', 'was', 'result',
+                'normal', 'range', 'value', 'test', 'report', 'blood', 'urine',
+                'serum', 'level', 'high', 'low', 'date', 'name', 'unit', 'ref'
+            }
+            if word not in COMMON_LAB_WORDS:
+                watermark_words.add(word)
+                logger.info("Detected watermark word: '%s' (appears %d times, %.1f%%)",
+                           word, count, frequency * 100)
+
+    if not watermark_words:
+        return text
+
+    # Remove watermark words from text (case-insensitive, whole word only)
+    cleaned = text
+    for wm_word in watermark_words:
+        pattern = re.compile(r'\b' + re.escape(wm_word) + r'\b', re.IGNORECASE)
+        cleaned = pattern.sub('', cleaned)
+
+    # Clean up extra whitespace left behind
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+    logger.info("Watermark removal: %d suspect words stripped from PDF text", len(watermark_words))
+    return cleaned.strip()
+
+
+def preprocess_image_remove_watermark(image_bytes: bytes) -> bytes:
+    """
+    Remove diagonal/repeated watermarks from scanned lab report images
+    before OCR. Uses OpenCV to detect and mask diagonal text patterns.
+    Returns cleaned image bytes (JPEG).
+    """
+    try:
+        import numpy as np
+        import cv2
+
+        # Decode image
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            logger.warning("Could not decode image for watermark removal")
+            return image_bytes
+
+        # Convert to grayscale for processing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Step 1: Detect text-like regions using adaptive thresholding
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            11, 2
+        )
+
+        # Step 2: Find connected components (text blobs)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            thresh, connectivity=8
+        )
+
+        # Step 3: Identify diagonal/watermark components
+        # Watermark text tends to be:
+        # - Medium sized (not too small like noise, not too large like headers)
+        # - Arranged diagonally across the page
+        # - Lower contrast than actual report text (lighter gray)
+        h, w = img.shape[:2]
+        page_area = h * w
+        watermark_mask = np.zeros(gray.shape, dtype=np.uint8)
+
+        # Detect light gray regions (watermark is usually 30-70% gray)
+        # while report text is near black (0-20% gray)
+        lower_gray = np.array([150])  # Light gray lower bound
+        upper_gray = np.array([220])  # Light gray upper bound
+        gray_mask = cv2.inRange(gray, lower_gray[0], upper_gray[0])
+
+        # Dilate to connect nearby watermark components
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        gray_mask_dilated = cv2.dilate(gray_mask, kernel, iterations=2)
+
+        # Find contours in the gray mask
+        contours, _ = cv2.findContours(
+            gray_mask_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        watermark_regions_found = 0
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            # Filter by area - watermark regions are medium-sized
+            if area < 500 or area > page_area * 0.15:
+                continue
+
+            # Check if region spans a significant diagonal
+            rect = cv2.boundingRect(contour)
+            rx, ry, rw, rh = rect
+            aspect_ratio = rw / max(rh, 1)
+
+            # Watermarks often have unusual aspect ratios (very wide or diagonal)
+            if aspect_ratio > 3 or (rw > w * 0.2 and rh > h * 0.05):
+                # Fill this region with white in the original image
+                cv2.fillPoly(img, [contour], (255, 255, 255))
+                watermark_regions_found += 1
+
+        if watermark_regions_found > 0:
+            logger.info("Image watermark removal: masked %d regions", watermark_regions_found)
+        else:
+            logger.info("Image watermark removal: no clear watermark regions detected")
+            # Return original if nothing found - don't degrade image quality unnecessarily
+            return image_bytes
+
+        # Encode back to JPEG
+        success, encoded = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not success:
+            logger.warning("Could not re-encode image after watermark removal")
+            return image_bytes
+
+        return encoded.tobytes()
+
+    except Exception as e:
+        logger.warning("Image watermark removal failed: %s — using original image", e)
+        return image_bytes  # Always fall back to original
 
 # ------------------------------------------------------------------
 # EasyOCR (lazy-loaded fallback)
@@ -175,7 +329,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.8.2",
+    version="1.9.0",
 )
 
 app.add_middleware(
@@ -268,7 +422,8 @@ def extract_text_easyocr(image_bytes: bytes) -> str:
 def extract_text_with_fallback(image_bytes: bytes) -> tuple[str, str]:
     """OCR an image (jpeg/png) with Google Vision -> EasyOCR fallback."""
     try:
-        text = extract_text_google_vision(image_bytes)
+    image_bytes = preprocess_image_remove_watermark(image_bytes)
+    text = extract_text_google_vision(image_bytes)
         if text and text.strip():
             logger.info("Google Vision succeeded (%d chars)", len(text))
             return text, "google_vision"
@@ -307,9 +462,10 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str]:
                     text_parts.append(page_text)
             full_text = "\n".join(text_parts).strip()
             if full_text and len(full_text) > 50:
-                logger.info("pdfplumber extracted %d chars from %d pages",
-                            len(full_text), len(pdf.pages))
-                return full_text, "pdf_text"
+    logger.info("pdfplumber extracted %d chars from %d pages",
+                len(full_text), len(pdf.pages))
+    full_text = strip_text_watermarks(full_text)
+    return full_text, "pdf_text"
             else:
                 logger.info("pdfplumber got only %d chars — likely a scanned PDF, falling back to OCR",
                             len(full_text))
