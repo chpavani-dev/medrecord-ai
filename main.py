@@ -422,7 +422,6 @@ def extract_text_easyocr(image_bytes: bytes) -> str:
 def extract_text_with_fallback(image_bytes: bytes) -> tuple[str, str]:
     """OCR an image (jpeg/png) with Google Vision -> EasyOCR fallback."""
     try:
-        image_bytes = preprocess_image_remove_watermark(image_bytes)
         text = extract_text_google_vision(image_bytes)
         if text and text.strip():
             logger.info("Google Vision succeeded (%d chars)", len(text))
