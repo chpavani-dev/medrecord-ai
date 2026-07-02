@@ -329,7 +329,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.0",
+    version="1.9.2",
 )
 
 app.add_middleware(
@@ -1323,32 +1323,246 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
             success=False, text="", engine="none",
             drugs=[], avg_confidence=0, error=str(e),
         )
+# ================================================================
+# ADD THIS FUNCTION to main.py 
+# Place it right before the _do_lab_report function (line ~1328)
+# ================================================================
 
+LAB_REPORT_VISION_PROMPT = """You are a clinical lab technician looking at a photograph of an Indian lab report (AMPATH, SRL, Thyrocare, Metropolis, Dr. Lal Path Labs, Apollo, Vijaya, etc.).
+
+The image may have watermarks, stamps, or diagonal text overlaid on it. READ THROUGH the watermarks carefully — the actual test values are printed underneath. Do not let watermark text confuse you.
+
+# YOUR TASK
+
+Parse this lab report into STRUCTURED JSON. A SINGLE upload may contain MULTIPLE PANELS — split them into separate panel objects.
+
+# DATE EXTRACTION (CRITICAL)
+
+Find `report_date`:
+- Look for "Reported on:", "Report Date:", "Date:", "Sample collected:", "Tested on:", "Approved on:"
+- Indian format is often DD/MM/YYYY (e.g., "29/06/2026" = June 29, 2026)
+- Normalize to YYYY-MM-DD format
+- If no date found, use null
+
+# READING VALUES THROUGH WATERMARKS
+
+Indian lab reports often have diagonal watermarks (lab logo, "CONFIDENTIAL", lab name).
+- Focus on the RESULT column — values are typically in the middle column
+- Reference ranges are in the right column
+- If a value appears partially obscured, use context clues (reference range, units) to determine the correct value
+- For example: if reference range is 0.50-0.90 and you can see "0.4" with an "L" flag, the value is 0.4
+- The "L" suffix means Low, "H" means High — these are FLAGS not part of the value
+
+# CATEGORIES
+
+Auto-categorize each panel into ONE of:
+- "Blood" — CBC, LFT, RFT/KFT, Lipid Panel, HbA1c, Thyroid, Glucose, Vitamin D/B12, Iron, Electrolytes
+- "Urine" — Urinalysis, Microalbumin, 24-hr protein, Urine culture
+- "Imaging" — X-Ray, CT, MRI, Ultrasound, Mammogram, Echo
+- "Pathology" — Biopsy, FNAC, Cytology, Histopathology
+- "Cardiac" — ECG, 2D Echo, TMT, Holter
+- "Other"
+
+# OUTPUT FORMAT
+
+Return ONLY a JSON object. No prose, no markdown fences:
+{
+  "lab_name": "name or null",
+  "report_date": "YYYY-MM-DD or null",
+  "patient_name": "name or null",
+  "panels": [
+    {
+      "panel_name": "Renal Function Tests",
+      "category": "Blood",
+      "tests": [
+        {
+          "name": "Creatinine",
+          "value": 0.4,
+          "unit": "mg/dL",
+          "normal_range": "0.50-0.90",
+          "flag": "low"
+        }
+      ]
+    }
+  ]
+}
+
+# RULES
+
+1. **value**: Number for numeric (0.4, 142.4). String for qualitative ("Yellow", "Trace"). Null ONLY if completely unreadable after careful inspection.
+2. **unit**: Exactly as printed. Null if no unit.
+3. **normal_range**: Extract from report. Null if not present.
+4. **flag**: "low" | "high" | "critical_low" | "critical_high" | "abnormal" | "normal" | null
+5. Extract EVERY test you see. Don't skip any.
+6. Look carefully through watermarks — most values ARE readable if you focus on the result column.
+
+Now carefully read the lab report image and return the JSON object:"""
+
+
+def parse_lab_report_with_claude_vision(image_bytes: bytes) -> dict:
+    """
+    Send lab report image DIRECTLY to Claude Vision.
+    Much better than OCR for watermarked Indian lab reports.
+    Claude can read through watermarks and understand document context.
+    Returns same shape as parse_lab_report_with_claude().
+    """
+    if not ANTHROPIC_API_KEY or not image_bytes:
+        return {"panels": [], "abnormal_findings": [], "lab_name": None, 
+                "report_date": None, "patient_name": None}
+
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 6144,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": LAB_REPORT_VISION_PROMPT},
+            ],
+        }],
+    }
+
+    text = ""
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers, json=payload, timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content_blocks = data.get("content", [])
+        text = "".join(
+            block.get("text", "") for block in content_blocks if block.get("type") == "text"
+        ).strip()
+
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            return {"panels": [], "abnormal_findings": [], "lab_name": None,
+                    "report_date": None, "patient_name": None}
+
+        result["report_date"] = normalize_date(result.get("report_date"))
+        result = post_process_lab_report(result)
+
+        n_panels = len(result.get("panels", []))
+        n_tests = sum(len(p.get("tests", [])) for p in result.get("panels", []))
+        n_abnormal = len(result.get("abnormal_findings", []))
+        logger.info("Vision lab parsed: %d panels, %d tests, %d abnormal | date: %s",
+                    n_panels, n_tests, n_abnormal, result.get("report_date"))
+
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.error("Claude vision returned invalid JSON for lab: %s | text: %s", e, text[:300])
+        return {"panels": [], "abnormal_findings": [], "lab_name": None,
+                "report_date": None, "patient_name": None}
+    except Exception as e:
+        logger.error("Claude vision lab parsing failed: %s", e)
+        return {"panels": [], "abnormal_findings": [], "lab_name": None,
+                "report_date": None, "patient_name": None}
+
+
+# ================================================================
+#  _do_lab_report function with this version
+# ================================================================
 
 async def _do_lab_report(file: UploadFile) -> LabReportResponse:
     try:
         file_bytes = await file.read()
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
-        text, engine = get_text_from_upload(file, file_bytes)
-        if engine == "pdf_failed" or not text:
+
+        is_pdf = detect_pdf(file, file_bytes)
+
+        # =================================================================
+        # PDF PATH: text extraction works well for PDFs — keep as-is
+        # =================================================================
+        if is_pdf:
+            text, engine = get_text_from_upload(file, file_bytes)
+            if engine == "pdf_failed" or not text:
+                return LabReportResponse(
+                    success=False, text="", engine=engine,
+                    panels=[], abnormal_findings=[],
+                    avg_confidence=0,
+                    error="Could not extract any text from PDF",
+                )
+            parsed = parse_lab_report_with_claude(text)
             return LabReportResponse(
-                success=False, text="", engine=engine,
+                success=True,
+                text=text, engine=engine,
+                lab_name=parsed.get("lab_name"),
+                report_date=parsed.get("report_date"),
+                patient_name=parsed.get("patient_name"),
+                panels=parsed.get("panels", []),
+                abnormal_findings=parsed.get("abnormal_findings", []),
+                avg_confidence=confidence_for_engine(engine),
+            )
+
+        # =================================================================
+        # IMAGE PATH: Use Claude Vision directly
+        # Much better than OCR for watermarked Indian lab reports
+        # Claude reads through watermarks and understands document context
+        # =================================================================
+        logger.info("Image lab report — using Claude Vision directly")
+        parsed = parse_lab_report_with_claude_vision(file_bytes)
+
+        if not parsed.get("panels"):
+            # Vision failed — fall back to OCR pipeline
+            logger.warning("Claude vision returned no panels — falling back to OCR")
+            text, engine = extract_text_with_fallback(file_bytes)
+            if text:
+                parsed = parse_lab_report_with_claude(text)
+                if parsed.get("panels"):
+                    return LabReportResponse(
+                        success=True,
+                        text=text, engine=f"vision_failed+{engine}",
+                        lab_name=parsed.get("lab_name"),
+                        report_date=parsed.get("report_date"),
+                        patient_name=parsed.get("patient_name"),
+                        panels=parsed.get("panels", []),
+                        abnormal_findings=parsed.get("abnormal_findings", []),
+                        avg_confidence=confidence_for_engine(engine),
+                    )
+            return LabReportResponse(
+                success=False, text="", engine="vision_failed",
                 panels=[], abnormal_findings=[],
                 avg_confidence=0,
-                error="Could not extract any text from upload",
+                error="Could not extract any data from image",
             )
-        parsed = parse_lab_report_with_claude(text)
+
         return LabReportResponse(
             success=True,
-            text=text, engine=engine,
+            text="", engine="claude_vision",
             lab_name=parsed.get("lab_name"),
             report_date=parsed.get("report_date"),
             patient_name=parsed.get("patient_name"),
             panels=parsed.get("panels", []),
             abnormal_findings=parsed.get("abnormal_findings", []),
-            avg_confidence=confidence_for_engine(engine),
+            avg_confidence=92,  # Claude Vision is highly accurate
         )
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1359,7 +1573,6 @@ async def _do_lab_report(file: UploadFile) -> LabReportResponse:
             avg_confidence=0, error=str(e),
         )
 
-
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -1368,7 +1581,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.0",
+        "version": "1.9.2",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
