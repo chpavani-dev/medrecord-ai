@@ -343,7 +343,7 @@ app.add_middleware(
 
 # ------------------------------------------------------------------
 # Response models
-# ------------------------------------------------------------------
+# ------------------------------------------------------------------LAB_REPORT_VISION_PROMPT
 class OCRResponse(BaseModel):
     success: bool
     text: str
@@ -1353,6 +1353,17 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
 LAB_REPORT_VISION_PROMPT = """You are a clinical lab technician looking at a photograph of an Indian lab report (AMPATH, SRL, Thyrocare, Metropolis, Dr. Lal Path Labs, Apollo, Vijaya, etc.).
 
 The image may have watermarks, stamps, or diagonal text overlaid on it. READ THROUGH the watermarks carefully — the actual test values are printed underneath. Do not let watermark text confuse you.
+
+# NARRATIVE / IMAGING REPORTS (PET-CT, CT, MRI, X-Ray, Ultrasound, Mammogram, Echo)
+Some reports are narrative imaging reports with findings text instead of numeric test values. For these:
+- Set category to "Imaging" (NOT "Blood")
+- Set panel_name to the scan type (e.g., "Whole Body PET-CT Scan")
+- Create ONE test entry per major section using qualitative string values:
+  {"name": "Impression", "value": "<one-sentence summary of the impression>", "unit": null, "normal_range": null, "flag": null}
+  Optionally add entries like {"name": "Findings - Chest", "value": "<brief summary>"} for key sections
+- Do NOT invent numeric values or reference ranges
+- Do NOT force narrative findings into Blood test format
+- Extract report_date from the report header as usual
 
 # YOUR TASK
 
