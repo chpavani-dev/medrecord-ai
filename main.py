@@ -329,7 +329,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.2",
+    version="1.9.3",
 )
 
 app.add_middleware(
@@ -1004,6 +1004,28 @@ Auto-categorize each panel into ONE of:
 - "Cardiac" — ECG, 2D Echo, TMT, Holter
 - "Other"
 
+# CATEGORIES
+Auto-categorize each panel into ONE of:
+- "Blood" — CBC, LFT, RFT/KFT, Lipid Panel, HbA1c, Thyroid, Glucose, Vitamin D/B12, Iron, Electrolytes
+- "Urine" — Urinalysis, Microalbumin, 24-hr protein, Urine culture
+- "Imaging" — X-Ray, CT, MRI, Ultrasound, Mammogram, Echo
+- "Pathology" — Biopsy, FNAC, Cytology, Histopathology
+- "Cardiac" — ECG, 2D Echo, TMT, Holter
+- "Other"
+
+# NARRATIVE / IMAGING REPORTS (PET-CT, CT, MRI, X-Ray, Ultrasound, Mammogram, Echo)
+Some reports are narrative imaging reports with findings text instead of numeric test values. For these:
+- Set category to "Imaging" (NOT "Blood")
+- Set panel_name to the scan type (e.g., "Whole Body PET-CT Scan")
+- Create ONE test entry per major section using qualitative string values:
+  {{"name": "Impression", "value": "<one-sentence summary of the impression>", "unit": null, "normal_range": null, "flag": null}}
+  Optionally add entries like {{"name": "Findings - Chest", "value": "<brief summary>"}} for key sections
+- Do NOT invent numeric values or reference ranges
+- Do NOT force narrative findings into Blood test format
+- Extract report_date from the report header as usual
+
+# COMMON PANELS
+
 # COMMON PANELS
 
 - "Complete Blood Count" / "CBC" / "Hemogram" -> Blood
@@ -1581,7 +1603,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.2",
+        "version": "1.9.3",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
