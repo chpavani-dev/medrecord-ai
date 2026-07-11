@@ -329,7 +329,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.3",
+    version="1.9.4",
 )
 
 app.add_middleware(
@@ -460,7 +460,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, str]:
                 if page_text:
                     text_parts.append(page_text)
             full_text = "\n".join(text_parts).strip()
-            if full_text and len(full_text) > 50:
+            if full_text and len(full_text) > 100 * len(pdf.pages):
                 logger.info("pdfplumber extracted %d chars from %d pages",
                             len(full_text), len(pdf.pages))
                 full_text = strip_text_watermarks(full_text)
@@ -1614,7 +1614,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.3",
+        "version": "1.9.4",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
