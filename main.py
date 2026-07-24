@@ -329,7 +329,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.4",
+    version="1.9.5",
 )
 
 app.add_middleware(
@@ -856,6 +856,137 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
         return {"drugs": [], "prescription_date": None, "doctor_name": None,
                 "hospital_name": None, "method": "vision_failed"}
 
+# ==================================================================
+# NEW v1.9.5 — Independent critic/verifier pass for prescription drugs
+# ==================================================================
+# Design rationale: this is a SEPARATE model call, not a "reconsider your
+# answer" instruction inside the same call. A model re-examining its own
+# just-generated reasoning in one context tends to rationalize agreement
+# with itself. A fresh call with no memory of generating the original
+# claim does not have that bias — it is judging a claim, not defending one.
+#
+# Fail-safe direction: ANY error, timeout, or malformed response results
+# in every drug being marked "unconfirmed" — never "confirmed" by default.
+# A critic failure must push toward more human review, never less.
+
+CRITIC_VERIFICATION_PROMPT = """You are verifying a colleague's prescription reading. You will see a photograph of a prescription and a list of medication names your colleague believes are written on it.
+
+Your ONLY job: for each item, determine if that exact name is visually present and legible in the image — NOT whether it is a medically plausible or common drug.
+
+Do NOT use your medical knowledge to guess what "might" be prescribed. Only confirm what you can actually see written on the page. If the handwriting is too messy, faded, or you cannot find that specific name anywhere on the image, mark it "unsure" — do not guess based on plausibility.
+
+MEDICATIONS TO VERIFY:
+{drug_list}
+
+For each one, respond with visible: "yes" (clearly present and matches), "no" (not present anywhere in the image), or "unsure" (present but illegible/ambiguous, or you are not confident).
+
+Return ONLY a JSON object, no prose, no markdown fences:
+{{
+  "verifications": [
+    {{"index": 0, "name": "<name as given>", "visible": "yes|no|unsure"}}
+  ]
+}}
+
+Now examine the image carefully and verify each item."""
+
+
+def verify_drugs_with_claude_vision(image_bytes: bytes, drugs: list) -> dict:
+    """
+    Independent second pass — verifies that each drug claimed by Pass 1
+    is actually visible in the image. Does NOT use medical plausibility
+    as evidence, only visual presence.
+
+    Fail-safe: any error, timeout, or unparseable response marks EVERY
+    drug "unconfirmed" rather than defaulting to trusted. Only an
+    explicit "yes" from the critic upgrades an entry to "confirmed".
+
+    Returns: {index: "confirmed" | "unconfirmed"} for every drug index,
+    always covering all indices 0..len(drugs)-1 regardless of outcome.
+    """
+    n = len(drugs)
+    fail_safe = {i: "unconfirmed" for i in range(n)}
+
+    if not ANTHROPIC_API_KEY or not image_bytes or n == 0:
+        return fail_safe
+
+    drug_list_text = "\n".join(
+        f'{i}. {d.get("name") or d.get("drug_name") or "Unknown"}'
+        for i, d in enumerate(drugs)
+    )
+
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 2048,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": CRITIC_VERIFICATION_PROMPT.format(drug_list=drug_list_text)},
+            ],
+        }],
+    }
+
+    text = ""
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers, json=payload, timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content_blocks = data.get("content", [])
+        text = "".join(
+            b.get("text", "") for b in content_blocks if b.get("type") == "text"
+        ).strip()
+
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
+        result = json.loads(text)
+        verifications = result.get("verifications", [])
+        if not isinstance(verifications, list):
+            logger.warning("Critic returned non-list verifications — failing safe to unconfirmed")
+            return fail_safe
+
+        verdicts = dict(fail_safe)  # start all-unconfirmed; only "yes" upgrades an entry
+        for v in verifications:
+            if not isinstance(v, dict):
+                continue
+            idx = v.get("index")
+            visible = str(v.get("visible", "")).lower()
+            if isinstance(idx, int) and 0 <= idx < n:
+                verdicts[idx] = "confirmed" if visible == "yes" else "unconfirmed"
+
+        n_confirmed = sum(1 for x in verdicts.values() if x == "confirmed")
+        logger.info("Critic verification: %d/%d drugs confirmed visible", n_confirmed, n)
+        return verdicts
+
+    except json.JSONDecodeError as e:
+        logger.error("Critic returned invalid JSON: %s | text: %s — failing safe", e, text[:300])
+        return fail_safe
+    except Exception as e:
+        logger.error("Critic verification failed: %s — failing safe, all unconfirmed", e)
+        return fail_safe
+
 
 def compute_avg_confidence(drugs: list, base_engine_confidence: int) -> int:
     """
@@ -1263,8 +1394,7 @@ async def _do_ocr(file: UploadFile) -> OCRResponse:
         logger.exception("OCR failed")
         return OCRResponse(success=False, text="", engine="none", error=str(e))
 
-
-async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
+async def _do_extract_drugs(file):
     try:
         file_bytes = await file.read()
         if not file_bytes:
@@ -1273,7 +1403,10 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
         is_pdf = detect_pdf(file, file_bytes)
 
         # =================================================================
-        # PDF PATH: text extraction (PDF text is clean — no need for vision)
+        # PDF PATH: unchanged — no critic pass. Printed PDF text is much
+        # lower hallucination risk than messy handwritten photos, which is
+        # where the observed fabrication actually occurred. Revisit if
+        # PDF false-positives show up too.
         # =================================================================
         if is_pdf:
             text, engine = get_text_from_upload(file, file_bytes)
@@ -1296,23 +1429,27 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
             )
 
         # =================================================================
-        # IMAGE PATH: ALWAYS use Claude vision (handles both printed + handwritten)
-        # The cheap OCR+Haiku-text path produces unreliable partial results on
-        # handwriting (drug names captured but no dosages/frequencies). Vision
-        # is roughly cost-neutral and produces holistic, usable results.
+        # IMAGE PATH: ALWAYS use Claude vision, then run an independent
+        # critic pass against the SAME image before returning. Every drug
+        # in the response gets a "verified": "confirmed"|"unconfirmed" key.
         # =================================================================
         logger.info("Image prescription — using Claude vision (always-on)")
         vision_result = extract_drugs_with_claude_vision(file_bytes)
         vision_drugs = vision_result.get("drugs", []) or []
 
         if not vision_drugs:
-            # Vision failed completely — last-ditch fallback to OCR pipeline
+            # Vision found nothing — last-ditch fallback to OCR pipeline.
+            # Still an image upload, so still run the critic against the
+            # original image bytes even though extraction came from OCR text.
             logger.warning("Claude vision returned 0 drugs — falling back to OCR")
             text, engine = get_text_from_upload(file, file_bytes)
             if text:
                 text_result = extract_drugs_with_claude(text)
                 text_drugs = text_result.get("drugs", []) or []
                 if text_drugs:
+                    verdicts = verify_drugs_with_claude_vision(file_bytes, text_drugs)
+                    for i, d in enumerate(text_drugs):
+                        d["verified"] = verdicts.get(i, "unconfirmed")
                     avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
                     return DrugExtractionResponse(
                         success=True, text=text, engine=f"vision_failed+{engine}",
@@ -1327,7 +1464,15 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
                 drugs=[], avg_confidence=0,
             )
 
-        # Vision succeeded — return its result
+        # Vision succeeded — run the critic pass before returning
+        verdicts = verify_drugs_with_claude_vision(file_bytes, vision_drugs)
+        for i, d in enumerate(vision_drugs):
+            d["verified"] = verdicts.get(i, "unconfirmed")
+
+        n_unconfirmed = sum(1 for d in vision_drugs if d.get("verified") == "unconfirmed")
+        if n_unconfirmed:
+            logger.warning("%d/%d drugs unconfirmed by critic pass", n_unconfirmed, len(vision_drugs))
+
         avg_conf = compute_avg_confidence(vision_drugs, 85)
         return DrugExtractionResponse(
             success=True, text="", engine="claude_vision",
@@ -1345,6 +1490,7 @@ async def _do_extract_drugs(file: UploadFile) -> DrugExtractionResponse:
             success=False, text="", engine="none",
             drugs=[], avg_confidence=0, error=str(e),
         )
+
 # ================================================================
 # ADD THIS FUNCTION to main.py 
 # Place it right before the _do_lab_report function (line ~1328)
@@ -1614,7 +1760,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.4",
+        "version": "1.9.5",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
