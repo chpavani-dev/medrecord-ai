@@ -329,7 +329,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.5",
+    version="1.9.7",
 )
 
 app.add_middleware(
@@ -706,6 +706,7 @@ A medication is something the patient TAKES. Usually:
 ❌ INSTRUCTIONS & LIFESTYLE (NEVER drugs):
    - "Fluid restriction <1L/day"
    - "Salt restriction"
+   - "Diabetic diet", "Low salt diet", "Renal diet" (dietary advice, not a drug)
    - "Walk 30 min daily"
    - "Review after X days"
    - "Follow up"
@@ -857,7 +858,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
                 "hospital_name": None, "method": "vision_failed"}
 
 # ==================================================================
-# NEW v1.9.5 — Independent critic/verifier pass for prescription drugs
+# NEW v1.9.7 — Independent critic/verifier pass for prescription drugs
 # ==================================================================
 # Design rationale: this is a SEPARATE model call, not a "reconsider your
 # answer" instruction inside the same call. A model re-examining its own
@@ -1010,7 +1011,7 @@ def filter_non_medications(drugs: list) -> list:
     """
     # Tokens that, if they appear as the WHOLE NAME (case-insensitive),
     # mean this isn't a drug. Order-sensitive: check exact name first.
-    NON_DRUG_NAMES = {
+   NON_DRUG_NAMES = {
         # Vitals
         "bp", "b.p", "b.p.", "blood pressure",
         "pr", "p.r", "p.r.", "pulse", "pulse rate",
@@ -1025,6 +1026,8 @@ def filter_non_medications(drugs: list) -> list:
         "cvs", "rs", "cns", "p/a", "cabg",
         # Lab tests (these are orders, not drugs)
         "cbc", "rft", "lft", "kft", "ecg", "echo", "x-ray", "mri", "ct", "ultrasound", "usg",
+        # Lifestyle / dietary instructions — not medications
+        "diabetic diet", "low salt diet", "salt diet", "diet", "renal diet",
     }
 
     # Phrase fragments that, if present anywhere in name/dosage, mean it's not a drug
@@ -1033,6 +1036,7 @@ def filter_non_medications(drugs: list) -> list:
         "dysfunction", "syndrome",
         "fluid restriction", "salt restriction",
         "review after", "follow up", "f/u",
+        "diet", "restriction", "advice",
     ]
 
     cleaned = []
@@ -1450,6 +1454,7 @@ async def _do_extract_drugs(file):
                     verdicts = verify_drugs_with_claude_vision(file_bytes, text_drugs)
                     for i, d in enumerate(text_drugs):
                         d["verified"] = verdicts.get(i, "unconfirmed")
+                        d["needs_review"] = (d.get("confidence") != "high") or (d["verified"] == "unconfirmed")
                     avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
                     return DrugExtractionResponse(
                         success=True, text=text, engine=f"vision_failed+{engine}",
@@ -1760,7 +1765,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.5",
+        "version": "1.9.7",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
