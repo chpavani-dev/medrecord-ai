@@ -1011,7 +1011,7 @@ def filter_non_medications(drugs: list) -> list:
     """
     # Tokens that, if they appear as the WHOLE NAME (case-insensitive),
     # mean this isn't a drug. Order-sensitive: check exact name first.
-   NON_DRUG_NAMES = {
+    NON_DRUG_NAMES = {
         # Vitals
         "bp", "b.p", "b.p.", "blood pressure",
         "pr", "p.r", "p.r.", "pulse", "pulse rate",
