@@ -329,7 +329,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.9",
+    version="1.9.10",
 )
 
 app.add_middleware(
@@ -606,7 +606,7 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
         "content-type": "application/json",
     }
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-sonnet-5",
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -863,7 +863,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
                 "hospital_name": None, "method": "vision_failed"}
 
 # ==================================================================
-# NEW v1.9.9 — Independent critic/verifier pass for prescription drugs
+# NEW v1.9.10 — Independent critic/verifier pass for prescription drugs
 # ==================================================================
 # Design rationale: this is a SEPARATE model call, not a "reconsider your
 # answer" instruction inside the same call. A model re-examining its own
@@ -927,7 +927,7 @@ def verify_drugs_with_claude_vision(image_bytes: bytes, drugs: list) -> dict:
         "content-type": "application/json",
     }
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-sonnet-5",
         "max_tokens": 2048,
         "messages": [{
             "role": "user",
@@ -1771,7 +1771,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.9",
+        "version": "1.9.10",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
