@@ -994,6 +994,91 @@ def verify_drugs_with_claude_vision(image_bytes: bytes, drugs: list) -> dict:
         return fail_safe
 
 
+# ==================================================================
+# EXPERIMENTAL — Gemini vision path for prescription drug extraction
+# Reuses the SAME DRUG_VISION_PROMPT as Claude, so results are directly
+# comparable. Fully separate function + endpoint — does not touch the
+# existing /ocr/prescription path at all.
+# ==================================================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY not set — Gemini extraction endpoint will fail")
+
+
+def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
+    """
+    Experimental: send prescription image to Gemini instead of Claude.
+    Same prompt, same expected JSON shape as extract_drugs_with_claude_vision,
+    so results can be compared directly.
+    """
+    if not GEMINI_API_KEY or not image_bytes:
+        return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                "hospital_name": None, "method": "gemini_failed"}
+
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": DRUG_VISION_PROMPT},
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+            ]
+        }]
+    }
+
+    text = ""
+    try:
+        response = requests.post(url, json=payload, timeout=90)
+        response.raise_for_status()
+        data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logger.error("Gemini returned no candidates")
+            return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                    "hospital_name": None, "method": "gemini_failed"}
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                    "hospital_name": None, "method": "gemini_failed"}
+
+        drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
+        drugs = post_process_drugs(drugs)
+        drugs = filter_non_medications(drugs)
+        drugs = add_drug_app_compat_fields(drugs)
+
+        rx_date = normalize_date(result.get("prescription_date"))
+
+        logger.info("Gemini extraction: %d drugs | date:%s", len(drugs), rx_date)
+
+        return {
+            "drugs": drugs,
+            "prescription_date": rx_date,
+            "doctor_name": result.get("doctor_name"),
+            "hospital_name": result.get("hospital_name"),
+            "method": "gemini",
+        }
+    except json.JSONDecodeError as e:
+        logger.error("Gemini returned invalid JSON: %s | text: %s", e, text[:300])
+        return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                "hospital_name": None, "method": "gemini_failed"}
+    except Exception as e:
+        logger.error("Gemini extraction failed: %s", e)
+        return {"drugs": [], "prescription_date": None, "doctor_name": None,
+                "hospital_name": None, "method": "gemini_failed"}
+
 def compute_avg_confidence(drugs: list, base_engine_confidence: int) -> int:
     """
     Combine engine quality with per-drug confidence to produce a 0-100 score.
@@ -1822,6 +1907,21 @@ async def ocr_prescription_endpoint(file: UploadFile = File(...)):
 async def ocr_report_endpoint(file: UploadFile = File(...)):
     return await _do_lab_report(file)
 
+@app.post("/ocr/prescription/gemini-test", response_model=DrugExtractionResponse)
+async def ocr_prescription_gemini_test_endpoint(file: UploadFile = File(...)):
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+    result = extract_drugs_with_gemini_vision(file_bytes)
+    drugs = result.get("drugs", []) or []
+    return DrugExtractionResponse(
+        success=True, text="", engine="gemini_test",
+        drugs=drugs,
+        prescription_date=result.get("prescription_date"),
+        doctor_name=result.get("doctor_name"),
+        hospital_name=result.get("hospital_name"),
+        avg_confidence=0,
+    )
 
 if __name__ == "__main__":
     import uvicorn
