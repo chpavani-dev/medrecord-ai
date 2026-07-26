@@ -669,6 +669,10 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
 # ==================================================================
 DRUG_VISION_PROMPT = """You are a clinical pharmacist looking at a photograph of an Indian doctor's prescription or hospital discharge summary. The handwriting may be messy. Read it carefully and extract ONLY medications.
 
+# CRITICAL — TRANSCRIBE EXACTLY AS WRITTEN, DO NOT AUTO-CORRECT TO A KNOWN BRAND
+
+Read each drug name letter-by-letter as it is actually written on the page. Do NOT substitute a familiar, commonly-prescribed brand name just because it looks similar or would make clinical sense in context. If the handwriting is genuinely ambiguous, write your best literal transcription of the actual strokes — even if the result is not a recognized drug name — and mark that drug's confidence as "low". Quietly "correcting" an unclear name to the nearest well-known brand is a more dangerous error than an honest low-confidence guess, because it looks just as trustworthy as a clear read.
+
 # YOUR TASK
 
 Return a JSON object with two parts:
@@ -759,6 +763,7 @@ Before you return, look at every item in your drugs list and ask:
 - Is this something a pharmacist would dispense? (If no → REMOVE)
 - Does the name contain "BP", "PR", "HR", "Wt", "Ht", "SpO2", "Temp", "BMI"? (If yes → REMOVE)
 - Is this a vital sign measurement like "130/85" or "91/min" or "98%"? (If yes → REMOVE)
+- Did you write this name exactly as it appears, or did you quietly substitute a more familiar/recognized brand because the handwriting was unclear? (If the latter → set confidence to "low")
 
 Read the image carefully and return the JSON object:"""
 
