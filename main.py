@@ -1,6 +1,11 @@
 """
 MedRecord OCR Microservice
-FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5
+FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5 + Gemini 2.5 Flash
+
+v1.9.2 — Gemini V2 Integration & Preprocessing:
+  - NEW: Integrated Google GenAI Client SDK (`gemini_client`) and added `/ocr/gemini-v2` endpoint using `gemini-2.5-flash` model.
+  - NEW: Integrated PIL contrast & sharpening preprocessing pipeline (`preprocess_medical_image`) to enhance legibility of handwritten notes.
+  - NEW: Configured `MEDICAL_OCR_SYSTEM_PROMPT` rules for Bowel & Bladder, abbreviations (B/BF, GRBS, P - 84/mt), BP hallucination prevention, and crossed-out timings.
 
 vv1.9.0 — Precision fix for handwritten prescriptions:
   - CHANGED: Tightened vision prompt to NOT extract vitals/diagnosis/instructions as drugs
@@ -49,7 +54,20 @@ import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from PIL import Image, ImageEnhance, ImageFilter
+from google import genai
+from google.genai import types
 
+#loading the env 
+
+from dotenv import load_dotenv
+
+# ------------------------------------------------------------------
+# Load Environment Variables explicitly from script directory
+# ------------------------------------------------------------------
+script_dir = os.path.dirname(os.path.abspath(__file__))
+dotenv_path = os.path.join(script_dir, ".env")
+load_dotenv(dotenv_path, override=True)
 # ------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------
@@ -64,11 +82,78 @@ logger = logging.getLogger("medrecord-ocr")
 # ------------------------------------------------------------------
 GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 if not GOOGLE_VISION_KEY:
     logger.warning("GOOGLE_VISION_KEY not set — Google Vision will be skipped")
 if not ANTHROPIC_API_KEY:
     logger.warning("ANTHROPIC_API_KEY not set — Claude parsing will be skipped")
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY not set — Gemini client will not be initialized")
+
+# ------------------------------------------------------------------
+# Strict Medical OCR System Prompt Template & Preprocessing Helpers
+# ------------------------------------------------------------------
+MEDICAL_OCR_SYSTEM_PROMPT = """
+You are a specialized clinical OCR and medical document analysis system.
+Your job is to perform literal, high-precision transcription of medical records and prescriptions.
+
+STRICT ACCURACY RULES:
+1. LITERAL DIGIT TRANSCRIPTION (CRITICAL):
+   - Blood Pressure Denominator: Inspect handwritten BP denominators letter-by-letter. Do NOT default to '80'. If the second digit in the denominator has a top horizontal bar and a curved bottom loop (like '85'), transcribe as '85'.
+   - Weight: Read weight numbers exactly. Do not turn '70' into '72' or '78'.
+   - Dytor Dosage: Verify whether the dosage is '5mg' or '10mg'. Do NOT default to '10mg'.
+   - Units: Transcribe literal strings (e.g., '< 1 lit/day' must NOT become '1.5 liters' or '1 1/2 Liters').
+2. CLINICAL EXAMINATION SHORTHAND:
+   - 'CVS: S1 S2' means Heart Sounds S1 and S2 heard. Do NOT transcribe as 'P' or 'C/V'.
+   - 'NAD' means No Abnormality Detected.
+3. CROSSED-OUT TEXT:
+   - Completely ignore any handwritten text that has strikethrough lines or pen marks drawn over it. Do NOT transcribe deleted text.
+4. PHARMACOPOEIA MATCHING:
+   - Match messy handwriting to standard pharmaceutical brand names (e.g., METXL, VALENTAS-D, Deplatt-CV, EPTUS, DYTOR, HYPONAT, L-MONTUS).
+5. AM/PM & ABBREVIATIONS:
+   - Distinguish 'am' vs 'pm' carefully based on exact lettering. 'S/P' means Status Post.
+6. NO SPECULATION:
+   - If a character or digit is illegible, mark it as [unclear] instead of guessing.
+7. CLINICAL SHORTHAND & SYMBOL RULES:
+   - Bowel & Bladder: 'Bowel & Bladder - Regular' is a clinical finding, NOT a patient's name.
+   - Abbreviations:
+     * 'B/BF' means 'Before Breakfast' (Once daily before morning food). Do NOT interpret as 'BID' or 'twice daily'.
+     * 'GRBS' or 'GR' means General Random Blood Sugar.
+     * 'P - 84/mt' means Pulse 84 per minute.
+   - Do Not Hallucinate BP: Do not report Blood Pressure (BP) unless explicitly written with 'BP' or 'mmHg'.
+   - Crossed-Out Timings: If a dosage line like '1 - [crossed out]' has pen marks drawn through it, mark the timing as [crossed out].
+
+Return a clear, structured Markdown summary of the document including:
+- Patient & Doctor Metadata
+- Vitals & Clinical Notes
+- Prescribed Medications (Name, Strength, Dosage, Timing, Duration)
+- Special Instructions / Restrictions
+"""
+
+def validate_and_read_image(file: UploadFile) -> bytes:
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
+    return file.file.read()
+
+def preprocess_medical_image(image: Image.Image) -> Image.Image:
+    """
+    Applies image enhancements to clean handwritten ink against paper.
+    Boosts contrast and sharpens pixel loops to prevent digit misreadings.
+    """
+    # 1. Convert to Grayscale
+    gray_image = image.convert("L")
+    
+    # 2. Enhance Contrast (makes faint pen strokes stand out)
+    enhancer = ImageEnhance.Contrast(gray_image)
+    high_contrast_image = enhancer.enhance(2.0)
+    
+    # 3. Apply Sharpening filter to define digit loops
+    sharpened_image = high_contrast_image.filter(ImageFilter.SHARPEN)
+    
+    return sharpened_image.convert("RGB")
 
 # ------------------------------------------------------------------
 # Standard 9 trends metrics (Tier 1)
@@ -329,7 +414,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.11",
+    version="1.9.2",
 )
 
 app.add_middleware(
@@ -789,6 +874,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
     payload = {
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 4096,
+        "temperature": 0,
         "messages": [{
             "role": "user",
             "content": [
@@ -863,7 +949,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
                 "hospital_name": None, "method": "vision_failed"}
 
 # ==================================================================
-# NEW v1.9.11 — Independent critic/verifier pass for prescription drugs
+# NEW v1.9.12 — Independent critic/verifier pass for prescription drugs
 # ==================================================================
 # Design rationale: this is a SEPARATE model call, not a "reconsider your
 # answer" instruction inside the same call. A model re-examining its own
@@ -929,6 +1015,7 @@ def verify_drugs_with_claude_vision(image_bytes: bytes, drugs: list) -> dict:
     payload = {
         "model": "claude-sonnet-5",
         "max_tokens": 2048,
+        "temperature": 0,
         "messages": [{
             "role": "user",
             "content": [
@@ -1000,9 +1087,7 @@ def verify_drugs_with_claude_vision(image_bytes: bytes, drugs: list) -> dict:
 # comparable. Fully separate function + endpoint — does not touch the
 # existing /ocr/prescription path at all.
 # ==================================================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY not set — Gemini extraction endpoint will fail")
+# GEMINI_API_KEY initialized globally at top
 
 
 def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
@@ -1018,6 +1103,7 @@ def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
+        "generationConfig": {"temperature": 0},
         "contents": [{
             "parts": [
                 {"text": DRUG_VISION_PROMPT},
@@ -1856,7 +1942,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.11",
+        "version": "1.9.2",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
@@ -1907,23 +1993,42 @@ async def ocr_prescription_endpoint(file: UploadFile = File(...)):
 async def ocr_report_endpoint(file: UploadFile = File(...)):
     return await _do_lab_report(file)
 
-@app.post("/ocr/prescription/gemini-test", response_model=DrugExtractionResponse)
-async def ocr_prescription_gemini_test_endpoint(file: UploadFile = File(...)):
-    file_bytes = await file.read()
-    if not file_bytes:
-        raise HTTPException(status_code=400, detail="Empty file")
-    result = extract_drugs_with_gemini_vision(file_bytes)
-    drugs = result.get("drugs", []) or []
-    return DrugExtractionResponse(
-        success=True, text="", engine="gemini_test",
-        drugs=drugs,
-        prescription_date=result.get("prescription_date"),
-        doctor_name=result.get("doctor_name"),
-        hospital_name=result.get("hospital_name"),
-        avg_confidence=0,
-    )
+# ------------------------------------------------------------------
+# 2b. Gemini V2 Endpoint (/ocr/gemini-v2) - WITH PIL PREPROCESSING
+# ------------------------------------------------------------------
+@app.post("/ocr/gemini-v2")
+async def ocr_gemini_v2(file: UploadFile = File(...)):
+    if not gemini_client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is missing.")
+
+    try:
+        image_bytes = validate_and_read_image(file)
+        raw_image = Image.open(io.BytesIO(image_bytes))
+
+        # Apply contrast & sharpening pre-processing pipeline
+        processed_image = preprocess_medical_image(raw_image)
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[processed_image, "Perform medical OCR on this image following all strict accuracy rules."],
+            config=types.GenerateContentConfig(
+                system_instruction=MEDICAL_OCR_SYSTEM_PROMPT,
+                temperature=0.0,  # Zero temperature for literal reading
+            ),
+        )
+
+        return {
+            "status": "success",
+            "provider": "google_gemini_v2_preprocessed",
+            "model": "gemini-2.5-flash",
+            "preprocessing": "grayscale_high_contrast_sharpen",
+            "ocr_result": response.text,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gemini v2 OCR failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app",host="localhost",port=8080,reload=True,reload_delay=5000,use_colors=True)
