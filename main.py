@@ -55,8 +55,6 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image, ImageEnhance, ImageFilter
-from google import genai
-from google.genai import types
 
 #loading the env 
 
