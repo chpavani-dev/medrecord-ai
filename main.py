@@ -56,6 +56,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image, ImageEnhance, ImageFilter
 
+
 #loading the env 
 
 from dotenv import load_dotenv
@@ -82,7 +83,6 @@ GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 if not GOOGLE_VISION_KEY:
     logger.warning("GOOGLE_VISION_KEY not set — Google Vision will be skipped")
@@ -94,9 +94,7 @@ if not GEMINI_API_KEY:
 # ------------------------------------------------------------------
 # Strict Medical OCR System Prompt Template & Preprocessing Helpers
 # ------------------------------------------------------------------
-MEDICAL_OCR_SYSTEM_PROMPT = """
-You are a specialized clinical OCR and medical document analysis system.
-Your job is to perform literal, high-precision transcription of medical records and prescriptions.
+
 
 STRICT ACCURACY RULES:
 1. LITERAL DIGIT TRANSCRIPTION (CRITICAL):
@@ -947,7 +945,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
                 "hospital_name": None, "method": "vision_failed"}
 
 # ==================================================================
-# NEW v1.9.12 — Independent critic/verifier pass for prescription drugs
+# NEW v1.9.13 — Independent critic/verifier pass for prescription drugs
 # ==================================================================
 # Design rationale: this is a SEPARATE model call, not a "reconsider your
 # answer" instruction inside the same call. A model re-examining its own
@@ -1991,42 +1989,3 @@ async def ocr_prescription_endpoint(file: UploadFile = File(...)):
 async def ocr_report_endpoint(file: UploadFile = File(...)):
     return await _do_lab_report(file)
 
-# ------------------------------------------------------------------
-# 2b. Gemini V2 Endpoint (/ocr/gemini-v2) - WITH PIL PREPROCESSING
-# ------------------------------------------------------------------
-@app.post("/ocr/gemini-v2")
-async def ocr_gemini_v2(file: UploadFile = File(...)):
-    if not gemini_client:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is missing.")
-
-    try:
-        image_bytes = validate_and_read_image(file)
-        raw_image = Image.open(io.BytesIO(image_bytes))
-
-        # Apply contrast & sharpening pre-processing pipeline
-        processed_image = preprocess_medical_image(raw_image)
-
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[processed_image, "Perform medical OCR on this image following all strict accuracy rules."],
-            config=types.GenerateContentConfig(
-                system_instruction=MEDICAL_OCR_SYSTEM_PROMPT,
-                temperature=0.0,  # Zero temperature for literal reading
-            ),
-        )
-
-        return {
-            "status": "success",
-            "provider": "google_gemini_v2_preprocessed",
-            "model": "gemini-2.5-flash",
-            "preprocessing": "grayscale_high_contrast_sharpen",
-            "ocr_result": response.text,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini v2 OCR failed: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8080"))
-    # uvicorn.run(app, host="0.0.0.0", port=port)
-    uvicorn.run("main:app",host="localhost",port=8080,reload=True,reload_delay=5000,use_colors=True)
