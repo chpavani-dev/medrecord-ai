@@ -1,11 +1,6 @@
 """
 MedRecord OCR Microservice
-FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5 + Gemini 2.5 Flash
-
-v1.9.2 — Gemini V2 Integration & Preprocessing:
-  - NEW: Integrated Google GenAI Client SDK (`gemini_client`) and added `/ocr/gemini-v2` endpoint using `gemini-2.5-flash` model.
-  - NEW: Integrated PIL contrast & sharpening preprocessing pipeline (`preprocess_medical_image`) to enhance legibility of handwritten notes.
-  - NEW: Configured `MEDICAL_OCR_SYSTEM_PROMPT` rules for Bowel & Bladder, abbreviations (B/BF, GRBS, P - 84/mt), BP hallucination prevention, and crossed-out timings.
+FastAPI + Google Vision (REST) + EasyOCR fallback + Claude Haiku 4.5 / Sonnet 5 + Gemini 2.5 Flash (experimental test endpoint)
 
 vv1.9.0 — Precision fix for handwritten prescriptions:
   - CHANGED: Tightened vision prompt to NOT extract vitals/diagnosis/instructions as drugs
@@ -54,19 +49,7 @@ import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image, ImageEnhance, ImageFilter
 
-
-#loading the env 
-
-from dotenv import load_dotenv
-
-# ------------------------------------------------------------------
-# Load Environment Variables explicitly from script directory
-# ------------------------------------------------------------------
-script_dir = os.path.dirname(os.path.abspath(__file__))
-dotenv_path = os.path.join(script_dir, ".env")
-load_dotenv(dotenv_path, override=True)
 # ------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------
@@ -83,115 +66,10 @@ GOOGLE_VISION_KEY = os.getenv("GOOGLE_VISION_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-
 if not GOOGLE_VISION_KEY:
     logger.warning("GOOGLE_VISION_KEY not set — Google Vision will be skipped")
 if not ANTHROPIC_API_KEY:
     logger.warning("ANTHROPIC_API_KEY not set — Claude parsing will be skipped")
-if not GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY not set — Gemini client will not be initialized")
-
-# ------------------------------------------------------------------
-# Strict Medical OCR System Prompt Template & Preprocessing Helpers
-# ------------------------------------------------------------------
-
-
-STRICT ACCURACY RULES:
-1. LITERAL DIGIT TRANSCRIPTION (CRITICAL):
-   - Blood Pressure Denominator: Inspect handwritten BP denominators letter-by-letter. Do NOT default to '80'. If the second digit in the denominator has a top horizontal bar and a curved bottom loop (like '85'), transcribe as '85'.
-   - Weight: Read weight numbers exactly. Do not turn '70' into '72' or '78'.
-   - Dytor Dosage: Verify whether the dosage is '5mg' or '10mg'. Do NOT default to '10mg'.
-   - Units: Transcribe literal strings (e.g., '< 1 lit/day' must NOT become '1.5 liters' or '1 1/2 Liters').
-2. CLINICAL EXAMINATION SHORTHAND:
-   - 'CVS: S1 S2' means Heart Sounds S1 and S2 heard. Do NOT transcribe as 'P' or 'C/V'.
-   - 'NAD' means No Abnormality Detected.
-3. CROSSED-OUT TEXT:
-   - Completely ignore any handwritten text that has strikethrough lines or pen marks drawn over it. Do NOT transcribe deleted text.
-4. PHARMACOPOEIA MATCHING:
-   - Match messy handwriting to standard pharmaceutical brand names (e.g., METXL, VALENTAS-D, Deplatt-CV, EPTUS, DYTOR, HYPONAT, L-MONTUS).
-5. AM/PM & ABBREVIATIONS:
-   - Distinguish 'am' vs 'pm' carefully based on exact lettering. 'S/P' means Status Post.
-6. NO SPECULATION:
-   - If a character or digit is illegible, mark it as [unclear] instead of guessing.
-7. CLINICAL SHORTHAND & SYMBOL RULES:
-   - Bowel & Bladder: 'Bowel & Bladder - Regular' is a clinical finding, NOT a patient's name.
-   - Abbreviations:
-     * 'B/BF' means 'Before Breakfast' (Once daily before morning food). Do NOT interpret as 'BID' or 'twice daily'.
-     * 'GRBS' or 'GR' means General Random Blood Sugar.
-     * 'P - 84/mt' means Pulse 84 per minute.
-   - Do Not Hallucinate BP: Do not report Blood Pressure (BP) unless explicitly written with 'BP' or 'mmHg'.
-   - Crossed-Out Timings: If a dosage line like '1 - [crossed out]' has pen marks drawn through it, mark the timing as [crossed out].
-
-Return a clear, structured Markdown summary of the document including:
-- Patient & Doctor Metadata
-- Vitals & Clinical Notes
-- Prescribed Medications (Name, Strength, Dosage, Timing, Duration)
-- Special Instructions / Restrictions
-"""
-
-def validate_and_read_image(file: UploadFile) -> bytes:
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
-    return file.file.read()
-
-def preprocess_medical_image(image: Image.Image) -> Image.Image:
-    """
-    Applies image enhancements to clean handwritten ink against paper.
-    Boosts contrast and sharpens pixel loops to prevent digit misreadings.
-    """
-    # 1. Convert to Grayscale
-    gray_image = image.convert("L")
-    
-    # 2. Enhance Contrast (makes faint pen strokes stand out)
-    enhancer = ImageEnhance.Contrast(gray_image)
-    high_contrast_image = enhancer.enhance(2.0)
-    
-    # 3. Apply Sharpening filter to define digit loops
-    sharpened_image = high_contrast_image.filter(ImageFilter.SHARPEN)
-    
-    return sharpened_image.convert("RGB")
-
-# ------------------------------------------------------------------
-# Standard 9 trends metrics (Tier 1)
-# ------------------------------------------------------------------
-STANDARD_METRICS = {
-    "hba1c", "glucose", "hemoglobin", "haemoglobin", "tsh",
-    "cholesterol", "ldl", "hdl", "triglycerides", "creatinine",
-}
-
-# ------------------------------------------------------------------
-# Test name normalization
-# ------------------------------------------------------------------
-TEST_NAME_NORMALIZATION = {
-    "creatinine": "Creatinine", "s. creatinine": "Creatinine",
-    "serum creatinine": "Creatinine", "creat": "Creatinine",
-    "hemoglobin": "Hemoglobin", "haemoglobin": "Hemoglobin",
-    "hgb": "Hemoglobin", "hb": "Hemoglobin",
-    "hba1c": "HbA1c", "glycated hemoglobin": "HbA1c", "glycosylated hemoglobin": "HbA1c",
-    "glucose": "Glucose", "fasting glucose": "Fasting Glucose", "fbs": "Fasting Glucose",
-    "ppbs": "Post Prandial Glucose", "post prandial glucose": "Post Prandial Glucose",
-    "rbs": "Random Glucose",
-    "tsh": "TSH", "thyroid stimulating hormone": "TSH",
-    "t3": "T3", "t4": "T4", "free t3": "Free T3", "free t4": "Free T4",
-    "cholesterol": "Total Cholesterol", "total cholesterol": "Total Cholesterol",
-    "ldl": "LDL Cholesterol", "ldl cholesterol": "LDL Cholesterol",
-    "hdl": "HDL Cholesterol", "hdl cholesterol": "HDL Cholesterol",
-    "triglycerides": "Triglycerides", "tg": "Triglycerides",
-    "uric acid": "Uric Acid",
-    "vitamin d": "Vitamin D", "25 oh vitamin d": "Vitamin D", "25-oh vitamin d": "Vitamin D",
-    "vitamin b12": "Vitamin B12", "b12": "Vitamin B12",
-    "wbc": "WBC", "white blood cells": "WBC",
-    "rbc": "RBC", "red blood cells": "RBC",
-    "platelets": "Platelets", "plt": "Platelets",
-    "esr": "ESR", "crp": "CRP",
-    "sgot": "SGOT (AST)", "ast": "SGOT (AST)",
-    "sgpt": "SGPT (ALT)", "alt": "SGPT (ALT)",
-    "bilirubin": "Bilirubin Total", "total bilirubin": "Bilirubin Total",
-    "urea": "Urea", "blood urea": "Urea", "bun": "BUN",
-    "sodium": "Sodium", "na": "Sodium",
-    "potassium": "Potassium", "k": "Potassium",
-}
-
 
 def normalize_test_name(raw_name: str) -> str:
     if not raw_name:
@@ -687,7 +565,7 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
         "content-type": "application/json",
     }
     payload = {
-        "model": "claude-sonnet-5",
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -868,9 +746,8 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
         "content-type": "application/json",
     }
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-sonnet-5",
         "max_tokens": 4096,
-        "temperature": 0,
         "messages": [{
             "role": "user",
             "content": [
@@ -945,7 +822,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
                 "hospital_name": None, "method": "vision_failed"}
 
 # ==================================================================
-# NEW v1.9.13 — Independent critic/verifier pass for prescription drugs
+# NEW v1.9.11 — Independent critic/verifier pass for prescription drugs
 # ==================================================================
 # Design rationale: this is a SEPARATE model call, not a "reconsider your
 # answer" instruction inside the same call. A model re-examining its own
@@ -1011,7 +888,6 @@ def verify_drugs_with_claude_vision(image_bytes: bytes, drugs: list) -> dict:
     payload = {
         "model": "claude-sonnet-5",
         "max_tokens": 2048,
-        "temperature": 0,
         "messages": [{
             "role": "user",
             "content": [
@@ -1099,7 +975,6 @@ def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "generationConfig": {"temperature": 0},
         "contents": [{
             "parts": [
                 {"text": DRUG_VISION_PROMPT},
@@ -1938,7 +1813,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.2",
+        "version": "1.9.13",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
@@ -1989,3 +1864,7 @@ async def ocr_prescription_endpoint(file: UploadFile = File(...)):
 async def ocr_report_endpoint(file: UploadFile = File(...)):
     return await _do_lab_report(file)
 
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
