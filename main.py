@@ -1600,7 +1600,21 @@ Some reports are narrative imaging reports with findings text instead of numeric
 Parse this lab report into STRUCTURED JSON. A SINGLE upload may contain MULTIPLE PANELS — split them into separate panel objects.
 
 # DATE EXTRACTION (CRITICAL)
+# IDENTIFYING THE LAB NAME (CRITICAL)
 
+Indian lab report letterheads are often busy, with multiple pieces of text near the top. `lab_name` must be ONLY the actual diagnostic lab's brand/company name (e.g. "AMPATH", "SRL Diagnostics", "Thyrocare", "Metropolis", "Dr. Lal PathLabs") — typically the largest, most prominent logo text.
+
+Do NOT include or substitute:
+- Descriptive taglines below the logo (e.g. "Central Reference Laboratory")
+- Accreditation marks or certifications (e.g. "ilac-MRA", "NABL", "ISO")
+- Physical addresses, door numbers, or city names
+- Registration/license numbers (e.g. "MC-2751")
+
+If the brand name and a tagline appear together, extract only the brand name.
+
+# PANEL NAME PRECISION
+
+`panel_name` should be the SPECIFIC test panel name as printed (e.g. "Liver Function Tests (LFT)", "Renal Function Tests"), not a generic shortened version (e.g. NOT just "Liver Test").
 Find `report_date`:
 - Look for "Reported on:", "Report Date:", "Date:", "Sample collected:", "Tested on:", "Approved on:"
 - Indian format is often DD/MM/YYYY (e.g., "29/06/2026" = June 29, 2026)
