@@ -80,7 +80,38 @@ def normalize_test_name(raw_name: str) -> str:
         return TEST_NAME_NORMALIZATION[key]
     return raw_name.strip().title()
 
-
+# ------------------------------------------------------------------
+# Test name normalization
+# ------------------------------------------------------------------
+TEST_NAME_NORMALIZATION = {
+    "creatinine": "Creatinine", "s. creatinine": "Creatinine",
+    "serum creatinine": "Creatinine", "creat": "Creatinine",
+    "hemoglobin": "Hemoglobin", "haemoglobin": "Hemoglobin",
+    "hgb": "Hemoglobin", "hb": "Hemoglobin",
+    "hba1c": "HbA1c", "glycated hemoglobin": "HbA1c", "glycosylated hemoglobin": "HbA1c",
+    "glucose": "Glucose", "fasting glucose": "Fasting Glucose", "fbs": "Fasting Glucose",
+    "ppbs": "Post Prandial Glucose", "post prandial glucose": "Post Prandial Glucose",
+    "rbs": "Random Glucose",
+    "tsh": "TSH", "thyroid stimulating hormone": "TSH",
+    "t3": "T3", "t4": "T4", "free t3": "Free T3", "free t4": "Free T4",
+    "cholesterol": "Total Cholesterol", "total cholesterol": "Total Cholesterol",
+    "ldl": "LDL Cholesterol", "ldl cholesterol": "LDL Cholesterol",
+    "hdl": "HDL Cholesterol", "hdl cholesterol": "HDL Cholesterol",
+    "triglycerides": "Triglycerides", "tg": "Triglycerides",
+    "uric acid": "Uric Acid",
+    "vitamin d": "Vitamin D", "25 oh vitamin d": "Vitamin D", "25-oh vitamin d": "Vitamin D",
+    "vitamin b12": "Vitamin B12", "b12": "Vitamin B12",
+    "wbc": "WBC", "white blood cells": "WBC",
+    "rbc": "RBC", "red blood cells": "RBC",
+    "platelets": "Platelets", "plt": "Platelets",
+    "esr": "ESR", "crp": "CRP",
+    "sgot": "SGOT (AST)", "ast": "SGOT (AST)",
+    "sgpt": "SGPT (ALT)", "alt": "SGPT (ALT)",
+    "bilirubin": "Bilirubin Total", "total bilirubin": "Bilirubin Total",
+    "urea": "Urea", "blood urea": "Urea", "bun": "BUN",
+    "sodium": "Sodium", "na": "Sodium",
+    "potassium": "Potassium", "k": "Potassium",
+}
 # ------------------------------------------------------------------
 # Date normalization
 # ------------------------------------------------------------------
@@ -1813,7 +1844,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.13",
+        "version": "1.9.14",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
