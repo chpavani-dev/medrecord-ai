@@ -71,6 +71,14 @@ if not GOOGLE_VISION_KEY:
 if not ANTHROPIC_API_KEY:
     logger.warning("ANTHROPIC_API_KEY not set — Claude parsing will be skipped")
 
+# ------------------------------------------------------------------
+# Standard 9 trends metrics (Tier 1)
+# ------------------------------------------------------------------
+STANDARD_METRICS = {
+    "hba1c", "glucose", "hemoglobin", "haemoglobin", "tsh",
+    "cholesterol", "ldl", "hdl", "triglycerides", "creatinine",
+}
+
 def normalize_test_name(raw_name: str) -> str:
     if not raw_name:
         return raw_name
@@ -1876,7 +1884,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.16",
+        "version": "1.9.17",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
