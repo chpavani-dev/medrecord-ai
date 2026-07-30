@@ -1198,6 +1198,24 @@ OCR TEXT:
 
 Parse this lab report into STRUCTURED JSON. A SINGLE upload may contain MULTIPLE PANELS — split them into separate panel objects.
 
+# IDENTIFYING THE LAB NAME (CRITICAL)
+
+Indian lab report letterheads are often busy, with multiple pieces of text near the top. `lab_name` must be ONLY the actual diagnostic lab's brand/company name (e.g. "AMPATH", "SRL Diagnostics", "Thyrocare", "Metropolis", "Dr. Lal PathLabs") — typically the largest, most prominent logo text.
+
+Do NOT include or substitute:
+- Descriptive taglines below the logo (e.g. "Central Reference Laboratory")
+- Accreditation marks or certifications (e.g. "ilac-MRA", "NABL", "ISO")
+- Physical addresses, door numbers, or city names
+- Registration/license numbers (e.g. "MC-2751")
+
+If the brand name and a tagline appear together, extract only the brand name.
+
+CONCRETE EXAMPLE: if the OCR text shows "AMPATH" as a logo name with "Central Reference Laboratory" printed as a tagline nearby, lab_name must be "AMPATH" — NEVER "Central Reference Laboratory" or any variation of the tagline text.
+
+# PANEL NAME PRECISION
+
+`panel_name` should be the SPECIFIC test panel name as printed (e.g. "Liver Function Tests (LFT)", "Renal Function Tests"), not a generic shortened version (e.g. NOT just "Liver Test").
+
 # DATE EXTRACTION (CRITICAL)
 
 Find `report_date`:
@@ -1858,7 +1876,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.15",
+        "version": "1.9.16",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
