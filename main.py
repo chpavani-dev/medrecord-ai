@@ -637,7 +637,7 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
 
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
-        drugs = filter_non_medications(drugs)
+        drugs, dietary_notes = filter_non_medications(drugs)
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -653,6 +653,8 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
             "prescription_date": rx_date,
             "doctor_name": result.get("doctor_name"),
             "hospital_name": result.get("hospital_name"),
+            "dietary_notes": dietary_notes,
+
         }
     except json.JSONDecodeError as e:
         logger.error("Claude returned invalid JSON for drugs: %s | text: %s", e, text[:300])
@@ -832,7 +834,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
 
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
-        drugs = filter_non_medications(drugs)
+        drugs, dietary_notes = filter_non_medications(drugs)
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -849,6 +851,7 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
             "prescription_date": rx_date,
             "doctor_name": result.get("doctor_name"),
             "hospital_name": result.get("hospital_name"),
+            "dietary_notes": dietary_notes,
             "method": "vision",
         }
     except json.JSONDecodeError as e:
@@ -1052,7 +1055,7 @@ def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
 
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
-        drugs = filter_non_medications(drugs)
+        drugs, dietary_notes = filter_non_medications(drugs)
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -1064,6 +1067,7 @@ def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
             "prescription_date": rx_date,
             "doctor_name": result.get("doctor_name"),
             "hospital_name": result.get("hospital_name"),
+            "dietary_notes": dietary_notes,
             "method": "gemini",
         }
     except json.JSONDecodeError as e:
@@ -1089,16 +1093,17 @@ def compute_avg_confidence(drugs: list, base_engine_confidence: int) -> int:
     return int(0.6 * drug_avg + 0.4 * base_engine_confidence)
 
 
-def filter_non_medications(drugs: list) -> list:
+def filter_non_medications(drugs: list) -> tuple[list, list]:
     """
     Safety-net filter. Drops items that are clearly vitals, diagnosis tokens,
     or lab test orders rather than medications. Used after Claude vision
     extraction to catch anything the prompt missed.
+ 
+    Returns (cleaned_drugs, dietary_notes) — dietary_notes collects any
+    lifestyle/diet advice lines that were filtered out, so the caller can
+    offer to save them as a Note instead of silently discarding them.
     """
-    # Tokens that, if they appear as the WHOLE NAME (case-insensitive),
-    # mean this isn't a drug. Order-sensitive: check exact name first.
-    NON_DRUG_NAMES = {
-        # Vitals
+    NON_DRUG_NAMES_DISCARD = {
         "bp", "b.p", "b.p.", "blood pressure",
         "pr", "p.r", "p.r.", "pulse", "pulse rate",
         "hr", "h.r", "heart rate",
@@ -1108,56 +1113,66 @@ def filter_non_medications(drugs: list) -> list:
         "temp", "temperature",
         "rr", "r.r", "respiratory rate",
         "bmi",
-        # Exam findings
         "cvs", "rs", "cns", "p/a", "cabg",
-        # Lab tests (these are orders, not drugs)
         "cbc", "rft", "lft", "kft", "ecg", "echo", "x-ray", "mri", "ct", "ultrasound", "usg",
-        # Lifestyle / dietary instructions — not medications
+    }
+    NON_DRUG_NAMES_DIETARY = {
         "diabetic diet", "low salt diet", "salt diet", "diet", "renal diet",
     }
-
-    # Phrase fragments that, if present anywhere in name/dosage, mean it's not a drug
-    NON_DRUG_PHRASES = [
+    NON_DRUG_PHRASES_DISCARD = [
         "mmhg", "/min", "kg", "%spo", "% spo",
         "dysfunction", "syndrome",
-        "fluid restriction", "salt restriction",
         "review after", "follow up", "f/u",
-        "diet", "restriction", "advice",
     ]
-
+    NON_DRUG_PHRASES_DIETARY = [
+        "diet", "fluid restriction", "salt restriction", "restriction", "advice",
+    ]
+ 
     cleaned = []
+    dietary_notes = []
     for d in drugs:
         if not isinstance(d, dict):
             continue
         raw_name = str(d.get("name", "") or "").strip()
         if not raw_name:
             continue
-
+ 
         name_lower = raw_name.lower()
-        # Strip leading "tab.", "cap.", "syp." etc to compare the core token
         core_name = re.sub(r"^\s*(tab|cap|syp|syr|inj|sol|drops)\.?\s+", "", name_lower).strip()
-
-        # Reject if the entire name is a known non-drug token
-        if core_name in NON_DRUG_NAMES:
-            logger.info("Filtered non-medication: %s (exact match)", raw_name)
-            continue
-
-        # Reject if any non-drug phrase is in the name or dosage field
         combined = (raw_name + " " + str(d.get("dosage", "") or "")).lower()
-        if any(phrase in combined for phrase in NON_DRUG_PHRASES):
-            logger.info("Filtered non-medication: %s (phrase match)", raw_name)
+ 
+        if core_name in NON_DRUG_NAMES_DIETARY or any(p in combined for p in NON_DRUG_PHRASES_DIETARY):
+            logger.info("Filtered as dietary/lifestyle note: %s", raw_name)
+            dietary_notes.append(raw_name)
             continue
-
-        # Reject obvious vital-sign value patterns in the name
-        # e.g. "130/85", "98%", "91/min"
+ 
+        if core_name in NON_DRUG_NAMES_DISCARD:
+            continue
+ 
+        if any(phrase in combined for phrase in NON_DRUG_PHRASES_DISCARD):
+            continue
+ 
         if re.search(r"\b\d{2,3}/\d{2,3}\b|\b\d{2,3}\s*%\b|\b\d{2,3}\s*/\s*min\b", raw_name):
-            logger.info("Filtered non-medication: %s (vital-value pattern)", raw_name)
             continue
-
+ 
         cleaned.append(d)
-
-    return cleaned
-
+ 
+    return cleaned, dietary_notes
+ 
+ 
+# Test against the real Star Hospitals prescription's mix of items
+test_drugs = [
+    {"name": "Tab Gemer Sita XR", "dosage": "1|50|1000"},
+    {"name": "Tab Neuvovane-PG", "dosage": ""},
+    {"name": "Diabetic diet", "dosage": ""},
+    {"name": "Tab Met XL", "dosage": "50mg"},
+    {"name": "Low salt diet", "dosage": ""},
+    {"name": "BP", "dosage": "160/80 mmHg"},
+]
+cleaned, notes = filter_non_medications(test_drugs)
+print("Real drugs kept:", [d["name"] for d in cleaned])
+print("Diet/lifestyle notes captured:", notes)
+ 
 
 def post_process_drugs(drugs: list) -> list:
     cleaned = []
@@ -1530,6 +1545,7 @@ async def _do_extract_drugs(file):
             return DrugExtractionResponse(
                 success=True, text=text, engine=engine,
                 drugs=text_drugs,
+                dietary_notes=text_result.get("dietary_notes", []),
                 prescription_date=text_result.get("prescription_date"),
                 doctor_name=text_result.get("doctor_name"),
                 hospital_name=text_result.get("hospital_name"),
@@ -1562,8 +1578,9 @@ async def _do_extract_drugs(file):
                     avg_conf = compute_avg_confidence(text_drugs, confidence_for_engine(engine))
                     return DrugExtractionResponse(
                         success=True, text=text, engine=f"vision_failed+{engine}",
-                        drugs=text_drugs,
-                        prescription_date=text_result.get("prescription_date"),
+                         drugs=text_drugs,
+                         dietary_notes=text_result.get("dietary_notes", []),
+                         prescription_date=text_result.get("prescription_date"),
                         doctor_name=text_result.get("doctor_name"),
                         hospital_name=text_result.get("hospital_name"),
                         avg_confidence=avg_conf,
@@ -1587,6 +1604,7 @@ async def _do_extract_drugs(file):
         return DrugExtractionResponse(
             success=True, text="", engine="claude_vision",
             drugs=vision_drugs,
+            dietary_notes=vision_result.get("dietary_notes", []),
             prescription_date=vision_result.get("prescription_date"),
             doctor_name=vision_result.get("doctor_name"),
             hospital_name=vision_result.get("hospital_name"),
