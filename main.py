@@ -327,7 +327,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.2",
+    version="1.9.19",
 )
 
 app.add_middleware(
@@ -1292,6 +1292,22 @@ Some reports are narrative imaging reports with findings text instead of numeric
 
 If panel name unclear, infer from tests present (Hb + WBC + Platelets = "Complete Blood Count").
 
+# ONLY GENUINE LAB TEST RESULTS BELONG HERE
+
+This document may also contain prescription medications, dietary/lifestyle advice, or clinical narrative notes mixed in with the lab values. Do NOT include these as "tests":
+
+NOT LAB TESTS (never include as a test row):
+   - Prescription medications (e.g. "Tab Gemer Sita XR", "Tab Met XL 50mg") - these are drugs, not test results
+   - Dietary/lifestyle advice (e.g. "Diabetic diet", "Low salt diet", "Fluid restriction") - these are instructions, not measurements
+   - Clinical exam findings without numeric values (e.g. "B/L Tkr - Advised", "Follow up advised")
+   - Rows whose result is a qualitative outcome like "Advised", "Prescribed" - these are not lab measurements
+
+ONLY include a row in "tests" if it is a genuine measured value: a vital sign (BP, weight, pulse, SpO2), or an actual lab test result, with a real numeric or qualitative lab outcome (e.g. "Present"/"Absent" for a urine test IS a valid lab result).
+
+# CRITICAL - TRANSCRIBE NUMBERS EXACTLY AS WRITTEN
+
+Read each numeric value carefully, digit by digit. A misread digit (e.g. transcribing "78" as "28") is a serious error since these values are used for medical trend tracking. If a number is genuinely unclear or ambiguous, set "confidence": "low" for that test rather than guessing - do NOT silently pick a plausible-looking number.
+
 # OUTPUT FORMAT
 
 Return ONLY a JSON object. No prose, no markdown fences:
@@ -1309,7 +1325,8 @@ Return ONLY a JSON object. No prose, no markdown fences:
           "value": 12.5,
           "unit": "g/dL",
           "normal_range": "13.0-17.0",
-          "flag": "low"
+          "flag": "low",
+          "confidence": "high"
         }}
       ]
     }}
@@ -1380,6 +1397,35 @@ def determine_flag(test_name: str, value, normal_range: str) -> Optional[str]:
             return "low" if value < float(m.group(1)) else "normal"
     return None
 
+def is_non_lab_test_row(name: str, value) -> bool:
+    """
+    Safety-net filter for lab reports — catches drug names, diet/lifestyle
+    advice, or narrative rows that slipped through despite prompt
+    instructions to exclude them. Mirrors filter_non_medications' approach
+    on the prescription side.
+    """
+    name_lower = (name or "").strip().lower()
+    if not name_lower:
+        return True
+
+    # Rows with a Tab/Cap/Syrup prefix are medications, not lab tests
+    if re.match(r"^\s*(tab|cap|syp|syr|inj|sol|drops)\.?\s+", name_lower):
+        return True
+
+    # Diet/lifestyle advice tokens
+    DIET_TOKENS = {"diabetic diet", "low salt diet", "salt diet", "diet", "renal diet",
+                   "fluid restriction", "salt restriction"}
+    if name_lower in DIET_TOKENS or "diet" in name_lower:
+        return True
+
+    # Qualitative "outcome" values that indicate this was advice/narrative,
+    # not a measured lab result
+    value_str = str(value or "").strip().lower()
+    if value_str in ("advised", "prescribed", "recommended"):
+        return True
+
+    return False
+
 
 def parse_lab_report_with_claude(ocr_text: str) -> dict:
     if not ANTHROPIC_API_KEY or not ocr_text or not ocr_text.strip():
@@ -1433,38 +1479,41 @@ def parse_lab_report_with_claude(ocr_text: str) -> dict:
     except Exception as e:
         logger.error("Claude lab parsing failed: %s", e)
         return {"panels": [], "abnormal_findings": []}
-
-
 def post_process_lab_report(result: dict) -> dict:
     panels = result.get("panels", [])
     if not isinstance(panels, list):
         panels = []
-
     abnormal_findings = []
-
     for panel in panels:
         if not isinstance(panel, dict):
             continue
         tests = panel.get("tests", [])
         if not isinstance(tests, list):
             continue
-
+        cleaned_tests = []
         for t in tests:
             if not isinstance(t, dict):
                 continue
             raw_name = t.get("name", "")
+            raw_value = t.get("value")
+
+            if is_non_lab_test_row(raw_name, raw_value):
+                logger.info("Filtered non-test row from lab report: %s", raw_name)
+                continue
+
             canonical = normalize_test_name(raw_name)
             t["name"] = canonical
             t["original_name"] = raw_name
             t["is_standard_metric"] = canonical.lower() in STANDARD_METRICS
-
             value = t.get("value")
             normal_range = t.get("normal_range") or ""
             our_flag = determine_flag(canonical, value, normal_range)
             if our_flag is not None:
                 t["flag"] = our_flag
-
             flag = t.get("flag")
+
+            t["needs_review"] = t.get("confidence") != "high"
+
             if flag in ("low", "high", "critical_low", "critical_high", "abnormal"):
                 abnormal_findings.append({
                     "name": canonical,
@@ -1475,19 +1524,16 @@ def post_process_lab_report(result: dict) -> dict:
                     "panel": panel.get("panel_name"),
                     "category": panel.get("category"),
                 })
-
+            cleaned_tests.append(t)
+        panel["tests"] = cleaned_tests
     result["panels"] = panels
     result["abnormal_findings"] = abnormal_findings
-
     n_panels = len(panels)
     n_tests = sum(len(p.get("tests", [])) for p in panels)
     n_abnormal = len(abnormal_findings)
     logger.info("Lab parsed: %d panels, %d tests, %d abnormal | date: %s",
                 n_panels, n_tests, n_abnormal, result.get("report_date"))
-
     return result
-
-
 # ------------------------------------------------------------------
 # Engine -> confidence mapping
 # ------------------------------------------------------------------
@@ -1683,7 +1729,21 @@ Auto-categorize each panel into ONE of:
 - "Pathology" — Biopsy, FNAC, Cytology, Histopathology
 - "Cardiac" — ECG, 2D Echo, TMT, Holter
 - "Other"
+# ONLY GENUINE LAB TEST RESULTS BELONG HERE
 
+This document may also contain prescription medications, dietary/lifestyle advice, or clinical narrative notes mixed in with the lab values. Do NOT include these as "tests":
+
+❌ NOT LAB TESTS (never include as a test row):
+   - Prescription medications (e.g. "Tab Gemer Sita XR", "Tab Met XL 50mg") — these are drugs, not test results
+   - Dietary/lifestyle advice (e.g. "Diabetic diet", "Low salt diet", "Fluid restriction") — these are instructions, not measurements
+   - Clinical exam findings without numeric values (e.g. "B/L Tkr — Advised", "Follow up advised")
+   - Rows whose result is a qualitative outcome like "Advised", "Prescribed" — these are not lab measurements
+
+✅ ONLY include a row in "tests" if it is a genuine measured value: a vital sign (BP, weight, pulse, SpO2), or an actual lab test result, with a real numeric or qualitative lab outcome (e.g. "Present"/"Absent" for a urine test IS a valid lab result).
+
+# CRITICAL — TRANSCRIBE NUMBERS EXACTLY AS WRITTEN
+
+Read each numeric value carefully, digit by digit. A misread digit (e.g. transcribing "78" as "28") is a serious error since these values are used for medical trend tracking. If a number is genuinely unclear or ambiguous, set "confidence": "low" for that test rather than guessing — do NOT silently pick a plausible-looking number.
 # OUTPUT FORMAT
 
 Return ONLY a JSON object. No prose, no markdown fences:
@@ -1696,12 +1756,13 @@ Return ONLY a JSON object. No prose, no markdown fences:
       "panel_name": "Renal Function Tests",
       "category": "Blood",
       "tests": [
-        {
+       {
           "name": "Creatinine",
           "value": 0.4,
           "unit": "mg/dL",
           "normal_range": "0.50-0.90",
-          "flag": "low"
+          "flag": "low",
+          "confidence": "high"
         }
       ]
     }
@@ -1739,7 +1800,7 @@ def parse_lab_report_with_claude_vision(image_bytes: bytes) -> dict:
         "content-type": "application/json",
     }
     payload = {
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-sonnet-5",
         "max_tokens": 6144,
         "messages": [{
             "role": "user",
@@ -1902,7 +1963,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.18",
+        "version": "1.9.19",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
@@ -1952,6 +2013,7 @@ async def ocr_prescription_endpoint(file: UploadFile = File(...)):
 @app.post("/ocr/report", response_model=LabReportResponse)
 async def ocr_report_endpoint(file: UploadFile = File(...)):
     return await _do_lab_report(file)
+
 
 if __name__ == "__main__":
     import uvicorn
