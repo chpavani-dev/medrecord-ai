@@ -327,7 +327,7 @@ def get_easyocr_reader():
 app = FastAPI(
     title="MedRecord OCR Service",
     description="OCR + AI parsing for prescriptions and lab reports (images + PDFs)",
-    version="1.9.19",
+    version="1.9.20",
 )
 
 app.add_middleware(
@@ -353,6 +353,9 @@ class DrugExtractionResponse(BaseModel):
     text: str
     engine: str
     drugs: list
+    dietary_notes: list = []
+    clinical_notes: list = []
+    has_lab_values: bool = False
     prescription_date: Optional[str] = None
     doctor_name: Optional[str] = None
     hospital_name: Optional[str] = None
@@ -567,6 +570,22 @@ Indian discharge summaries have TWO sections:
 - Indian dosing: 1-0-0, 1-1-1, BD, TDS, HS, SOS
 - Set "source": "current"
 
+# CLINICAL NOTES / SYMPTOMS (capture separately, NEVER as drugs)
+
+Doctors often write the patient's symptoms, complaints, and history alongside the prescription. Capture these in "clinical_notes" as a list of short readable strings. Do NOT put any of these in "drugs".
+
+Include:
+- Presenting complaints and symptoms (e.g. "Complains of tingling sensation in both feet", "Complains of dizziness and giddiness")
+- Relevant history (e.g. "History of bilateral total knee replacement", "Dietary compliance inadequate")
+- Examination findings written as narrative (e.g. "CVS - S1 S2 present", "RS - bilateral air entry present")
+- Follow-up instructions (e.g. "Review after 10 days with FBS/PPBS")
+
+Expand obvious medical shorthand where you are confident (c/o = complains of, H/O = history of, B/L = bilateral). If part of a note is illegible, transcribe only what you can actually read rather than guessing at the rest. If there are no clinical notes on the document, return an empty list.
+
+# LAB VALUES DETECTION
+
+Some documents also contain lab or test results alongside the prescription (e.g. "FBS 211", "HbA1c 9.1%", "PPBS 326"). Do NOT extract these as drugs or as clinical notes. Instead, simply set "has_lab_values" to true if you can see any measured lab test results with numeric values on this document, and false otherwise.
+
 # OUTPUT FORMAT
 
 Return ONLY a JSON object. No prose, no markdown fences:
@@ -574,6 +593,8 @@ Return ONLY a JSON object. No prose, no markdown fences:
   "prescription_date": "YYYY-MM-DD or null",
   "doctor_name": "Dr. Name or null",
   "hospital_name": "Hospital or null",
+  "clinical_notes": ["Complains of tingling sensation in both feet", "History of bilateral total knee replacement"],
+  "has_lab_values": false,
   "drugs": [
     {{
       "name": "drug name",
@@ -638,6 +659,11 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
         drugs, dietary_notes = filter_non_medications(drugs)
+        clinical_notes = [
+            str(n).strip() for n in (result.get("clinical_notes") or [])
+            if isinstance(n, (str, int, float)) and str(n).strip()
+        ][:20]
+        has_lab_values = bool(result.get("has_lab_values"))
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -654,6 +680,8 @@ def extract_drugs_with_claude(ocr_text: str) -> dict:
             "doctor_name": result.get("doctor_name"),
             "hospital_name": result.get("hospital_name"),
             "dietary_notes": dietary_notes,
+            "clinical_notes": clinical_notes,
+            "has_lab_values": has_lab_values,
 
         }
     except json.JSONDecodeError as e:
@@ -737,6 +765,22 @@ For each drug, include "confidence": "high", "medium", or "low":
 - "medium" = at least one field required interpretation
 - "low" = significant guesswork on name or dose
 
+# CLINICAL NOTES / SYMPTOMS (capture separately, NEVER as drugs)
+
+Doctors often write the patient's symptoms, complaints, and history alongside the prescription. Capture these in "clinical_notes" as a list of short readable strings. Do NOT put any of these in "drugs".
+
+Include:
+- Presenting complaints and symptoms (e.g. "Complains of tingling sensation in both feet", "Complains of dizziness and giddiness")
+- Relevant history (e.g. "History of bilateral total knee replacement", "Dietary compliance inadequate")
+- Examination findings written as narrative (e.g. "CVS - S1 S2 present", "RS - bilateral air entry present")
+- Follow-up instructions (e.g. "Review after 10 days with FBS/PPBS")
+
+Expand obvious medical shorthand where you are confident (c/o = complains of, H/O = history of, B/L = bilateral). If part of a note is illegible, transcribe only what you can actually read rather than guessing at the rest. If there are no clinical notes on the document, return an empty list.
+
+# LAB VALUES DETECTION
+
+Some documents also contain lab or test results alongside the prescription (e.g. "FBS 211", "HbA1c 9.1%", "PPBS 326"). Do NOT extract these as drugs or as clinical notes. Instead, simply set "has_lab_values" to true if you can see any measured lab test results with numeric values on this document, and false otherwise.
+
 # OUTPUT FORMAT
 
 Return ONLY JSON, no prose, no markdown fences:
@@ -744,6 +788,8 @@ Return ONLY JSON, no prose, no markdown fences:
   "prescription_date": "YYYY-MM-DD or null",
   "doctor_name": "string or null",
   "hospital_name": "string or null",
+  "clinical_notes": ["Complains of tingling sensation in both feet", "History of bilateral total knee replacement"],
+  "has_lab_values": false,
   "drugs": [
     {
       "name": "drug name as written (e.g., 'Tab. Deplatt-CV')",
@@ -835,6 +881,11 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
         drugs, dietary_notes = filter_non_medications(drugs)
+        clinical_notes = [
+            str(n).strip() for n in (result.get("clinical_notes") or [])
+            if isinstance(n, (str, int, float)) and str(n).strip()
+        ][:20]
+        has_lab_values = bool(result.get("has_lab_values"))
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -852,6 +903,8 @@ def extract_drugs_with_claude_vision(image_bytes: bytes) -> dict:
             "doctor_name": result.get("doctor_name"),
             "hospital_name": result.get("hospital_name"),
             "dietary_notes": dietary_notes,
+            "clinical_notes": clinical_notes,
+            "has_lab_values": has_lab_values,
             "method": "vision",
         }
     except json.JSONDecodeError as e:
@@ -1056,6 +1109,11 @@ def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
         drugs = result.get("drugs", []) if isinstance(result.get("drugs"), list) else []
         drugs = post_process_drugs(drugs)
         drugs, dietary_notes = filter_non_medications(drugs)
+        clinical_notes = [
+            str(n).strip() for n in (result.get("clinical_notes") or [])
+            if isinstance(n, (str, int, float)) and str(n).strip()
+        ][:20]
+        has_lab_values = bool(result.get("has_lab_values"))
         drugs = add_drug_app_compat_fields(drugs)
 
         rx_date = normalize_date(result.get("prescription_date"))
@@ -1068,6 +1126,8 @@ def extract_drugs_with_gemini_vision(image_bytes: bytes) -> dict:
             "doctor_name": result.get("doctor_name"),
             "hospital_name": result.get("hospital_name"),
             "dietary_notes": dietary_notes,
+            "clinical_notes": clinical_notes,
+            "has_lab_values": has_lab_values,
             "method": "gemini",
         }
     except json.JSONDecodeError as e:
@@ -1592,6 +1652,8 @@ async def _do_extract_drugs(file):
                 success=True, text=text, engine=engine,
                 drugs=text_drugs,
                 dietary_notes=text_result.get("dietary_notes", []),
+                clinical_notes=text_result.get("clinical_notes", []),
+                has_lab_values=text_result.get("has_lab_values", False),
                 prescription_date=text_result.get("prescription_date"),
                 doctor_name=text_result.get("doctor_name"),
                 hospital_name=text_result.get("hospital_name"),
@@ -1626,6 +1688,8 @@ async def _do_extract_drugs(file):
                         success=True, text=text, engine=f"vision_failed+{engine}",
                          drugs=text_drugs,
                          dietary_notes=text_result.get("dietary_notes", []),
+                         clinical_notes=text_result.get("clinical_notes", []),
+                         has_lab_values=text_result.get("has_lab_values", False),
                          prescription_date=text_result.get("prescription_date"),
                         doctor_name=text_result.get("doctor_name"),
                         hospital_name=text_result.get("hospital_name"),
@@ -1651,6 +1715,8 @@ async def _do_extract_drugs(file):
             success=True, text="", engine="claude_vision",
             drugs=vision_drugs,
             dietary_notes=vision_result.get("dietary_notes", []),
+            clinical_notes=vision_result.get("clinical_notes", []),
+            has_lab_values=vision_result.get("has_lab_values", False),
             prescription_date=vision_result.get("prescription_date"),
             doctor_name=vision_result.get("doctor_name"),
             hospital_name=vision_result.get("hospital_name"),
@@ -1963,7 +2029,7 @@ def root():
     return {
         "service": "MedRecord OCR",
         "status": "running",
-        "version": "1.9.19",
+        "version": "1.9.20",
         "google_vision_configured": bool(GOOGLE_VISION_KEY),
         "claude_configured": bool(ANTHROPIC_API_KEY),
         "supported_formats": ["JPEG", "PNG", "PDF (digital and scanned)"],
